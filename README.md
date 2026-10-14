@@ -161,23 +161,13 @@ python -m unittest discover tests
 
 ---
 
-## State Persistence
+## State Persistence (SQLite Database)
 
-All downloaded torrent identifiers and the last processed week are saved to `data/state.json`:
+All downloaded torrent history, execution runs, and metadata are saved to an embedded SQLite database at `data/nfl_grabber.db` (configured via `DB_PATH`):
 
-```json
-{
-  "last_processed_week": "Week 5",
-  "last_run_timestamp": "2026-10-13T10:50:00Z",
-  "processed_torrents": [
-    {
-      "id": "https://720pier.ru/download/file.php?id=...",
-      "title": "Kansas City Chiefs vs Denver Broncos",
-      "week": "Week 5",
-      "added_at": "2026-10-13T10:50:00Z"
-    }
-  ]
-}
-```
+- **`processed_torrents` table**: Tracks all added torrent URLs, titles, weeks, ratings, and timestamps to prevent duplicates.
+- **`runs` table**: Logs execution history with start/completion times, status (`SUCCESS`, `NO_TORRENTS`, `ERROR`), torrents added count, and next scheduled run time.
+- **`metadata` table**: Stores key-value state such as `last_processed_week` and `next_run_at`.
+- **Automatic Migration**: On startup, if a legacy `data/state.json` file is present, records are automatically migrated into SQLite and backed up as `data/state.json.bak`.
 
-When deployed in Docker, this folder is mounted as a volume (`./data:/app/data`), preserving your state across container restarts and image updates.
+When deployed in Docker, the `./data` directory is mounted as a volume (`./data:/app/data`), preserving your database and state across container rebuilds and updates.

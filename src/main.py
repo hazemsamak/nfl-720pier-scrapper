@@ -17,6 +17,7 @@ if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
 from src.config import Config
+from src.database import DatabaseManager
 from src.notifier import Notifier
 from src.qbittorrent import QBittorrentClient
 from src.scraper import PierScraper
@@ -75,6 +76,66 @@ def is_scheduled_day(allowed_days: Optional[List[str]], dt: Optional[datetime] =
     return any(d.startswith(short_day) or short_day.startswith(d) or d == full_day for d in norm)
 
 
+def calculate_next_run_time(
+    allowed_days: Optional[List[str]],
+    interval_hours: float,
+    current_dt: Optional[datetime] = None,
+) -> datetime:
+    """
+    Calculates the exact next datetime when the grabber will actively run based on schedule days and interval.
+    If the next interval step lands on an excluded day (e.g. Thu-Sun), it projects forward
+    to the first interval tick on the next allowed day (e.g. Monday).
+    """
+    from datetime import timedelta
+
+    try:
+        hours_val = float(interval_hours)
+    except (TypeError, ValueError):
+        hours_val = 6.0
+
+    base_dt = current_dt or datetime.now()
+    step_delta = timedelta(hours=max(0.1, hours_val))
+    candidate = base_dt + step_delta
+
+    # If all days are allowed, simply return the next interval
+    if not allowed_days:
+        return candidate
+
+    # Advance candidate until it matches an allowed day (up to 30 days maximum lookahead)
+    max_steps = int(24 * 30 / max(0.1, hours_val)) + 1
+    steps = 0
+    while not is_scheduled_day(allowed_days, candidate) and steps < max_steps:
+        candidate += step_delta
+        steps += 1
+
+    return candidate
+
+
+def format_relative_time(target_dt: datetime, base_dt: Optional[datetime] = None) -> str:
+    """Formats a datetime into a human-readable relative string like 'in 2 hours, 15 minutes'."""
+    now = base_dt or datetime.now()
+    delta = target_dt - now
+    total_seconds = int(delta.total_seconds())
+
+    if total_seconds <= 0:
+        return "now"
+
+    days, remainder = divmod(total_seconds, 86400)
+    hours, remainder = divmod(remainder, 3600)
+    minutes, _ = divmod(remainder, 60)
+
+    parts = []
+    if days > 0:
+        parts.append(f"{days} day{'s' if days > 1 else ''}")
+    if hours > 0:
+        parts.append(f"{hours} hour{'s' if hours > 1 else ''}")
+    if minutes > 0 and days == 0:
+        parts.append(f"{minutes} minute{'s' if minutes > 1 else ''}")
+
+    rel = ", ".join(parts) if parts else "less than a minute"
+    return f"in {rel}"
+
+
 def execute_grabber_cycle(
     config: Config, state: StateManager, notifier: Notifier, dry_run: bool = False
 ) -> int:
@@ -87,6 +148,13 @@ def execute_grabber_cycle(
     5. Dispatches notifications / alerts via Discord and Telegram.
     Returns count of newly added torrents.
     """
+    run_id = None
+    if hasattr(state, "record_run_start") and not dry_run:
+        try:
+            run_id = state.record_run_start()
+        except Exception as e:
+            logger.debug("Run start record notice: %s", e)
+
     try:
         logger.info("==================================================")
         logger.info("Starting NFL THUUZ torrent check%s...", " (DRY RUN)" if dry_run else "")
@@ -123,6 +191,8 @@ def execute_grabber_cycle(
                         raise qbittorrentapi.LoginFailed("Authentication failed: not logged in to qBittorrent")
             except qbittorrentapi.LoginFailed as e:
                 logger.error("qBittorrent authentication failed: %s", e)
+                if run_id and hasattr(state, "record_run_completion"):
+                    state.record_run_completion(run_id, status="ERROR", error_message="qBittorrent Authentication Failure")
                 notifier.notify_error(
                     title="qBittorrent Authentication Failure",
                     details=f"Failed to authenticate with qBittorrent at {config.qbit_host}: {e}",
@@ -135,6 +205,8 @@ def execute_grabber_cycle(
                 logger.error("qBittorrent connection failed: %s", e)
                 is_auth = any(term in err_str for term in ["401", "403", "Unauthorized", "Forbidden", "Invalid API key"])
                 if is_auth:
+                    if run_id and hasattr(state, "record_run_completion"):
+                        state.record_run_completion(run_id, status="ERROR", error_message="qBittorrent Unauthorized")
                     notifier.notify_error(
                         title="qBittorrent Authentication Failure",
                         details=f"Unauthorized access to qBittorrent at {config.qbit_host}: {e}",
@@ -142,6 +214,8 @@ def execute_grabber_cycle(
                         context={"Host": config.qbit_host},
                     )
                 else:
+                    if run_id and hasattr(state, "record_run_completion"):
+                        state.record_run_completion(run_id, status="ERROR", error_message="qBittorrent Connection Failure")
                     notifier.notify_error(
                         title="qBittorrent Connection Failure",
                         details=f"Could not connect to qBittorrent server at {config.qbit_host}: {e}",
@@ -156,6 +230,8 @@ def execute_grabber_cycle(
         except Exception as e:
             err_str = str(e)
             logger.error("Failed to fetch THUUZ ratings thread: %s", e)
+            if run_id and hasattr(state, "record_run_completion"):
+                state.record_run_completion(run_id, status="ERROR", error_message=f"Failed to fetch thread HTML: {e}")
             is_auth = any(term in err_str for term in ["401", "403", "Forbidden", "Unauthorized", "Cloudflare"])
             if is_auth:
                 notifier.notify_error(
@@ -186,6 +262,8 @@ def execute_grabber_cycle(
         )
         if not top_torrents:
             logger.warning("No torrent links could be extracted from %s.", week_title)
+            if run_id and hasattr(state, "record_run_completion"):
+                state.record_run_completion(run_id, status="NO_TORRENTS", week_title=week_title)
             return 0
 
         logger.info("Evaluating %d match candidate(s) for %s...", len(top_torrents), week_title)
@@ -260,9 +338,24 @@ def execute_grabber_cycle(
                     context={"Match": title, "File": filename},
                 )
 
+        next_run_dt = calculate_next_run_time(config.schedule_days, config.check_interval_hours)
+        next_run_str = f"{next_run_dt.strftime('%A, %b %d at %H:%M')} ({format_relative_time(next_run_dt)})"
+
+        if run_id and hasattr(state, "record_run_completion") and not dry_run:
+            try:
+                state.record_run_completion(
+                    run_id=run_id,
+                    status="SUCCESS" if newly_added else "NO_TORRENTS",
+                    week_title=week_title,
+                    torrents_added_count=len(newly_added),
+                    next_run_at=next_run_dt.isoformat(),
+                )
+            except Exception as e:
+                logger.debug("Run completion record notice: %s", e)
+
         if newly_added and not dry_run:
             logger.info("Summary: %d new torrent(s) pushed to qBittorrent for %s.", len(newly_added), week_title)
-            notifier.notify_torrents_added(week_title, newly_added)
+            notifier.notify_torrents_added(week_title, newly_added, next_run_str=next_run_str)
         elif dry_run:
             logger.info("[DRY RUN] Finished check. %d match(es) identified for %s.", len(newly_added), week_title)
         else:
@@ -274,6 +367,15 @@ def execute_grabber_cycle(
 
     except Exception as e:
         logger.exception("Unexpected error during NFL grabber cycle: %s", e)
+        if run_id and hasattr(state, "record_run_completion") and not dry_run:
+            try:
+                state.record_run_completion(
+                    run_id=run_id,
+                    status="ERROR",
+                    error_message=f"{type(e).__name__}: {e}",
+                )
+            except Exception:
+                pass
         notifier.notify_error(
             title="Unexpected Grabber Error",
             details=f"An unhandled exception halted the grabber cycle: {type(e).__name__}: {e}",
@@ -289,7 +391,7 @@ def main():
     args = parser.parse_args()
 
     config = Config.load()
-    state = StateManager(config.state_file_path)
+    state = DatabaseManager(db_path=config.db_path, legacy_json_path=config.state_file_path)
     notifier = Notifier(
         discord_webhook_url=config.discord_webhook_url,
         telegram_bot_token=config.telegram_bot_token,
@@ -313,6 +415,16 @@ def main():
         interval_hours,
     )
 
+    def log_next_run(base_dt=None):
+        next_dt = calculate_next_run_time(config.schedule_days, interval_hours, current_dt=base_dt)
+        rel_str = format_relative_time(next_dt, base_dt=base_dt)
+        logger.info(
+            "Next grabber cycle scheduled for: %s (%s)",
+            next_dt.strftime("%A, %Y-%m-%d %H:%M:%S"),
+            rel_str,
+        )
+        return next_dt
+
     def run_scheduled_cycle():
         current_day_name = datetime.now().strftime("%A")
         if not is_scheduled_day(config.schedule_days):
@@ -321,8 +433,11 @@ def main():
                 current_day_name,
                 days_label,
             )
+            log_next_run()
             return 0
-        return execute_grabber_cycle(config, state, notifier)
+        res = execute_grabber_cycle(config, state, notifier)
+        log_next_run()
+        return res
 
     # Initial run on startup (only if today is an active scheduled day)
     today_name = datetime.now().strftime("%A")
@@ -336,6 +451,7 @@ def main():
             days_label,
         )
 
+    log_next_run()
     schedule.every(interval_hours).hours.do(run_scheduled_cycle)
 
     while running:
