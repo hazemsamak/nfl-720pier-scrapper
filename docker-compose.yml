@@ -5,6 +5,8 @@ services:
       dockerfile: Dockerfile
     container_name: nfl-torrent-grabber
     restart: unless-stopped
+    environment:
+      - TZ=${TZ:-Asia/Dubai}
     env_file:
       - .env
     volumes:
