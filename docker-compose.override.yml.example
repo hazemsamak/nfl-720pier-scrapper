@@ -1,0 +1,24 @@
+# ==============================================================================
+# Docker Compose Local Override Example
+# ==============================================================================
+# If you need to join an existing Docker network (e.g., your qBittorrent network),
+# copy this file to 'docker-compose.override.yml' on your server:
+#
+#   cp docker-compose.override.yml.example docker-compose.override.yml
+#
+# Docker Compose automatically merges 'docker-compose.override.yml' with
+# 'docker-compose.yml'. Because 'docker-compose.override.yml' is in .gitignore,
+# you can run 'git pull' anytime without any git conflicts!
+# ==============================================================================
+
+services:
+  nfl-grabber:
+    networks:
+      - default
+      - qbit_net
+
+networks:
+  default:
+  qbit_net:
+    external: true
+    name: qbittorrent_default  # <-- Replace with your actual qBittorrent Docker network name

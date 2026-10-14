@@ -1,0 +1,21 @@
+services:
+  nfl-grabber:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: nfl-torrent-grabber
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+    # Reach host/LAN ports directly (e.g. http://host.docker.internal:8087)
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+# ------------------------------------------------------------------------------
+# NOTE: To join your existing qBittorrent Docker network WITHOUT touching this file
+# (which keeps 'git pull' clean with zero conflicts), copy and customize:
+#   cp docker-compose.override.yml.example docker-compose.override.yml
+# Docker Compose will automatically load and merge it!
+# ------------------------------------------------------------------------------
