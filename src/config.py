@@ -32,6 +32,7 @@ class Config:
     check_interval_hours: float
     schedule_days: list[str]
     state_file_path: str
+    db_path: str
 
     # Optional Proxy
     proxy_url: Optional[str]
@@ -73,6 +74,7 @@ class Config:
                 if d.strip()
             ],
             state_file_path=os.getenv("STATE_FILE_PATH", "data/state.json").strip(),
+            db_path=os.getenv("DB_PATH", "data/nfl_grabber.db").strip(),
             discord_webhook_url=os.getenv("DISCORD_WEBHOOK_URL", "").strip() or None,
             telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN", "").strip() or None,
             telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID", "").strip() or None,

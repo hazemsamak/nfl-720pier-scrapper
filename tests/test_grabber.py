@@ -470,6 +470,8 @@ class TestNFLGrabber(unittest.TestCase):
         config.pier_thread_url = "https://720pier.ru/viewtopic.php?t=76272"
         config.rename_torrent_files = False
         config.favorite_teams = None
+        config.check_interval_hours = 6.0
+        config.schedule_days = ["Mon", "Tue", "Wed"]
 
         state = MagicMock()
         state.is_torrent_processed.return_value = False
@@ -504,6 +506,8 @@ class TestNFLGrabber(unittest.TestCase):
         config.rename_torrent_files = False
         config.favorite_teams = None
         config.qbit_save_path = "/nfl"
+        config.check_interval_hours = 6.0
+        config.schedule_days = ["Mon", "Tue", "Wed"]
 
         state = MagicMock()
         state.is_torrent_processed.return_value = False
@@ -530,6 +534,150 @@ class TestNFLGrabber(unittest.TestCase):
             notifier.notify_error.assert_called_once()
             call_kwargs = notifier.notify_error.call_args[1]
             self.assertEqual(call_kwargs["title"], "qBittorrent Forwarding Failure")
+
+
+    def test_database_manager_operations(self):
+        from src.database import DatabaseManager
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            db = DatabaseManager(db_path=db_path, legacy_json_path=None)
+
+            self.assertFalse(db.is_torrent_processed("https://720pier.ru/download/101"))
+            self.assertEqual(db.get_processed_count(), 0)
+
+            # Insert new record
+            inserted = db.record_processed_torrent(
+                torrent_id="https://720pier.ru/download/101",
+                title="Kansas City Chiefs at Denver Broncos",
+                week="Week 5",
+                rating="98",
+            )
+            self.assertTrue(inserted)
+            self.assertTrue(db.is_torrent_processed("https://720pier.ru/download/101"))
+            self.assertEqual(db.get_processed_count(), 1)
+            self.assertEqual(db.get_last_processed_week(), "Week 5")
+
+            # Duplicate insert should return False and not increment count
+            duplicate = db.record_processed_torrent(
+                torrent_id="https://720pier.ru/download/101",
+                title="Kansas City Chiefs at Denver Broncos",
+                week="Week 5",
+            )
+            self.assertFalse(duplicate)
+            self.assertEqual(db.get_processed_count(), 1)
+
+            db.close()
+
+    def test_database_manager_migration_from_json(self):
+        from src.database import DatabaseManager
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            json_path = os.path.join(tmpdir, "state.json")
+            db_path = os.path.join(tmpdir, "migrated.db")
+
+            # Create existing legacy state.json
+            legacy_content = {
+                "last_processed_week": "Week 4",
+                "last_run_timestamp": "2026-10-10T12:00:00Z",
+                "processed_torrents": [
+                    {
+                        "id": "https://720pier.ru/download/201",
+                        "title": "Match 1",
+                        "week": "Week 4",
+                        "added_at": "2026-10-10T12:00:00Z",
+                    },
+                    {
+                        "id": "https://720pier.ru/download/202",
+                        "title": "Match 2",
+                        "week": "Week 4",
+                        "added_at": "2026-10-10T12:00:00Z",
+                    },
+                ],
+            }
+            with open(json_path, "w", encoding="utf-8") as f:
+                json.dump(legacy_content, f)
+
+            # Initialize DatabaseManager pointing to this legacy json
+            db = DatabaseManager(db_path=db_path, legacy_json_path=json_path)
+
+            self.assertEqual(db.get_processed_count(), 2)
+            self.assertTrue(db.is_torrent_processed("https://720pier.ru/download/201"))
+            self.assertTrue(db.is_torrent_processed("https://720pier.ru/download/202"))
+            self.assertEqual(db.get_last_processed_week(), "Week 4")
+
+            # Verify backup file created
+            bak_path = f"{json_path}.bak"
+            self.assertTrue(os.path.exists(bak_path))
+
+            db.close()
+
+    def test_database_manager_run_history(self):
+        from src.database import DatabaseManager
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "history.db")
+            db = DatabaseManager(db_path=db_path, legacy_json_path=None)
+
+            run_id = db.record_run_start(week_title="Week 5")
+            self.assertIsInstance(run_id, int)
+
+            db.record_run_completion(
+                run_id=run_id,
+                status="SUCCESS",
+                week_title="Week 5",
+                torrents_added_count=2,
+                next_run_at="2026-10-19T06:00:00",
+            )
+
+            runs = db.get_recent_runs(limit=5)
+            self.assertEqual(len(runs), 1)
+            self.assertEqual(runs[0]["id"], run_id)
+            self.assertEqual(runs[0]["status"], "SUCCESS")
+            self.assertEqual(runs[0]["torrents_added_count"], 2)
+            self.assertEqual(runs[0]["next_run_at"], "2026-10-19T06:00:00")
+            self.assertEqual(db.get_next_run_at(), "2026-10-19T06:00:00")
+
+            db.close()
+
+    def test_calculate_next_run_time(self):
+        from datetime import datetime
+        from src.main import calculate_next_run_time
+
+        allowed_days = ["Mon", "Tue", "Wed"]
+
+        # Monday 10:00 with 6 hour interval -> Monday 16:00
+        t1 = datetime(2026, 10, 12, 10, 0, 0)
+        next1 = calculate_next_run_time(allowed_days, 6.0, current_dt=t1)
+        self.assertEqual(next1, datetime(2026, 10, 12, 16, 0, 0))
+
+        # Wednesday 20:00 with 6 hour interval -> Thu 02:00 (skip) -> Thu 08:00 (skip) ... -> Mon 02:00
+        t2 = datetime(2026, 10, 14, 20, 0, 0)
+        next2 = calculate_next_run_time(allowed_days, 6.0, current_dt=t2)
+        self.assertEqual(next2.strftime("%A"), "Monday")
+        self.assertEqual(next2, datetime(2026, 10, 19, 2, 0, 0))
+
+        # No day restrictions -> next tick directly
+        next_any = calculate_next_run_time([], 6.0, current_dt=t2)
+        self.assertEqual(next_any, datetime(2026, 10, 15, 2, 0, 0))
+
+    def test_format_relative_time(self):
+        from datetime import datetime, timedelta
+        from src.main import format_relative_time
+
+        base = datetime(2026, 10, 14, 12, 0, 0)
+
+        # 30 minutes ahead
+        t1 = base + timedelta(minutes=30)
+        self.assertEqual(format_relative_time(t1, base_dt=base), "in 30 minutes")
+
+        # 4 hours ahead
+        t2 = base + timedelta(hours=4)
+        self.assertEqual(format_relative_time(t2, base_dt=base), "in 4 hours")
+
+        # 2 days, 3 hours ahead
+        t3 = base + timedelta(days=2, hours=3)
+        self.assertEqual(format_relative_time(t3, base_dt=base), "in 2 days, 3 hours")
 
 
 if __name__ == "__main__":

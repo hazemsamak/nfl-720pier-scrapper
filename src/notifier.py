@@ -28,7 +28,12 @@ class Notifier:
         self.cooldown_seconds = cooldown_seconds
         self._recent_errors: Dict[str, float] = {}
 
-    def notify_torrents_added(self, week_title: str, torrents: list) -> None:
+    def notify_torrents_added(
+        self,
+        week_title: str,
+        torrents: list,
+        next_run_str: Optional[str] = None,
+    ) -> None:
         """Notifies user when new torrents have been queued into qBittorrent."""
         if not torrents:
             return
@@ -40,6 +45,10 @@ class Notifier:
             rating = t.get("rating", "N/A")
             fav_badge = " ⭐ *(Favorite Team)*" if t.get("is_favorite_team") else ""
             lines.append(f"{idx}. [{rating}/100]{fav_badge} {title}")
+
+        if next_run_str:
+            lines.append("")
+            lines.append(f"⏰ **Next Scheduled Run:** {next_run_str}")
 
         message = "\n".join(lines)
         self.send_discord(message)
