@@ -22,6 +22,7 @@ from src.notifier import Notifier
 from src.qbittorrent import QBittorrentClient
 from src.scraper import PierScraper
 from src.state import StateManager
+from src.web import start_web_server, update_service_status
 
 # Configure clean, informative logging
 logging.basicConfig(
@@ -254,6 +255,7 @@ def execute_grabber_cycle(
 
         week_title, week_elem = scraper.find_latest_week_section(soup)
         logger.info("Active Week: %s", week_title)
+        update_service_status(active_week=week_title)
 
         top_torrents = scraper.extract_top_torrent_links(
             week_elem,
@@ -391,6 +393,11 @@ def main():
     args = parser.parse_args()
 
     config = Config.load()
+
+    # Start embedded lightweight web log viewer server
+    if getattr(config, "web_enabled", True):
+        start_web_server(port=config.web_port, db_path=config.db_path)
+
     state = DatabaseManager(db_path=config.db_path, legacy_json_path=config.state_file_path)
     notifier = Notifier(
         discord_webhook_url=config.discord_webhook_url,
@@ -418,6 +425,8 @@ def main():
     def log_next_run(base_dt=None):
         next_dt = calculate_next_run_time(config.schedule_days, interval_hours, current_dt=base_dt)
         rel_str = format_relative_time(next_dt, base_dt=base_dt)
+        formatted_next = f"{next_dt.strftime('%A, %Y-%m-%d %H:%M:%S')} ({rel_str})"
+        update_service_status(next_run=formatted_next, status="Running")
         logger.info(
             "Next grabber cycle scheduled for: %s (%s)",
             next_dt.strftime("%A, %Y-%m-%d %H:%M:%S"),
@@ -435,7 +444,12 @@ def main():
             )
             log_next_run()
             return 0
+        update_service_status(status="Active Cycle Running")
         res = execute_grabber_cycle(config, state, notifier)
+        update_service_status(
+            status="Running",
+            last_run=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        )
         log_next_run()
         return res
 

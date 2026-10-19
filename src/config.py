@@ -42,6 +42,10 @@ class Config:
     telegram_bot_token: Optional[str]
     telegram_chat_id: Optional[str]
 
+    # Web Server & Log Viewer
+    web_port: int
+    web_enabled: bool
+
     @classmethod
     def load(cls) -> "Config":
         return cls(
@@ -78,4 +82,6 @@ class Config:
             discord_webhook_url=os.getenv("DISCORD_WEBHOOK_URL", "").strip() or None,
             telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN", "").strip() or None,
             telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID", "").strip() or None,
+            web_port=int(os.getenv("WEB_PORT", "5020")),
+            web_enabled=os.getenv("WEB_ENABLED", "true").lower() in ("true", "1", "yes"),
         )
