@@ -319,6 +319,57 @@ class TestNFLGrabber(unittest.TestCase):
                 new_torrent_name="Week 05 - Buffalo Bills at Los Angeles Rams (2026)",
             )
 
+    def test_qbittorrent_rename_content_retry_on_404(self):
+        import qbittorrentapi
+        from src.qbittorrent import QBittorrentClient
+        client = QBittorrentClient(host="http://localhost:8080", api_key="qbt_test")
+        mock_api = MagicMock()
+        mock_file = MagicMock()
+        mock_file.name = "NFL-2026-10-18.W06_ARI@LAR.mkv"
+
+        # First call raises NotFound404Error (simulating qBittorrent asynchronous registration)
+        # Second call returns the files list
+        mock_api.torrents_files.side_effect = [
+            qbittorrentapi.NotFound404Error("Torrent hash(es): mock_hash_456"),
+            [mock_file],
+        ]
+
+        with patch.object(client, "get_client", return_value=mock_api):
+            success = client.rename_torrent_content(
+                torrent_hash="mock_hash_456",
+                custom_name="Week 06 - Arizona Cardinals at Los Angeles Rams (2026)",
+                max_retries=3,
+                delay_seconds=0.01,
+            )
+            self.assertTrue(success)
+            self.assertEqual(mock_api.torrents_files.call_count, 2)
+            mock_api.torrents_rename_file.assert_called_once_with(
+                torrent_hash="mock_hash_456",
+                old_path="NFL-2026-10-18.W06_ARI@LAR.mkv",
+                new_path="Week 06 - Arizona Cardinals at Los Angeles Rams (2026).mkv",
+            )
+            mock_api.torrents_rename.assert_called_once_with(
+                torrent_hash="mock_hash_456",
+                new_torrent_name="Week 06 - Arizona Cardinals at Los Angeles Rams (2026)",
+            )
+
+    def test_qbittorrent_rename_content_exhausts_retries(self):
+        import qbittorrentapi
+        from src.qbittorrent import QBittorrentClient
+        client = QBittorrentClient(host="http://localhost:8080", api_key="qbt_test")
+        mock_api = MagicMock()
+        mock_api.torrents_files.side_effect = qbittorrentapi.NotFound404Error("Torrent hash(es): mock_hash_456")
+
+        with patch.object(client, "get_client", return_value=mock_api):
+            success = client.rename_torrent_content(
+                torrent_hash="mock_hash_456",
+                custom_name="Week 06 - Arizona Cardinals at Los Angeles Rams (2026)",
+                max_retries=2,
+                delay_seconds=0.01,
+            )
+            self.assertFalse(success)
+            self.assertEqual(mock_api.torrents_files.call_count, 2)
+
 
     def test_notifier_error_discord_embed(self):
         notifier = Notifier(discord_webhook_url="https://discord.com/api/webhooks/mock")

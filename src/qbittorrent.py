@@ -83,21 +83,40 @@ class QBittorrentClient:
             logger.warning("qBittorrent connection test failed: %s", e)
             return False
 
-    def rename_torrent_content(self, torrent_hash: str, custom_name: str, max_retries: int = 6) -> bool:
+    def rename_torrent_content(
+        self,
+        torrent_hash: str,
+        custom_name: str,
+        max_retries: int = 10,
+        delay_seconds: float = 1.0,
+    ) -> bool:
         """
         Renames the underlying media file on disk and the torrent display name in qBittorrent.
         custom_name: e.g. 'Week 05 - Buffalo Bills at Los Angeles Rams (2026)'
         """
         import os
         import time
+
+        clean_name = os.path.splitext(custom_name)[0]
         try:
             client = self.get_client()
-            clean_name = os.path.splitext(custom_name)[0]
+        except Exception as e:
+            logger.warning("Failed to obtain qBittorrent client to rename torrent %s: %s", torrent_hash, e)
+            return False
 
-            for _ in range(max_retries):
+        last_error = None
+        for attempt in range(1, max_retries + 1):
+            try:
                 files = client.torrents_files(torrent_hash=torrent_hash)
                 if files:
-                    old_file_name = files[0].name
+                    media_files = [
+                        f
+                        for f in files
+                        if any(f.name.lower().endswith(ext) for ext in [".mkv", ".mp4", ".ts", ".avi", ".mov"])
+                    ]
+                    target_file = max(media_files, key=lambda f: getattr(f, "size", 0)) if media_files else files[0]
+
+                    old_file_name = target_file.name
                     _, ext = os.path.splitext(old_file_name)
                     new_file_name = f"{clean_name}{ext or '.mkv'}"
 
@@ -113,13 +132,37 @@ class QBittorrentClient:
                     )
                     logger.info("Renamed torrent and content file in qBittorrent: '%s'", new_file_name)
                     return True
-                time.sleep(0.5)
+                else:
+                    logger.debug(
+                        "Attempt %d/%d: No files returned yet for torrent %s",
+                        attempt,
+                        max_retries,
+                        torrent_hash,
+                    )
+            except Exception as e:
+                last_error = e
+                logger.debug(
+                    "Attempt %d/%d to rename torrent %s failed (%s). Retrying in %ss...",
+                    attempt,
+                    max_retries,
+                    torrent_hash,
+                    e,
+                    delay_seconds,
+                )
 
+            if attempt < max_retries:
+                time.sleep(delay_seconds)
+
+        if last_error:
+            logger.warning(
+                "Failed to rename torrent content for %s after %d attempts: %s",
+                torrent_hash,
+                max_retries,
+                last_error,
+            )
+        else:
             logger.warning("Could not rename torrent %s: no files found within timeout", torrent_hash)
-            return False
-        except Exception as e:
-            logger.warning("Failed to rename torrent content for %s: %s", torrent_hash, e)
-            return False
+        return False
 
     def add_torrent_file(
         self,
@@ -128,6 +171,8 @@ class QBittorrentClient:
         custom_name: Optional[str] = None,
     ) -> bool:
         """Uploads .torrent binary data to qBittorrent and optionally renames the content file."""
+        import time
+
         try:
             client = self.get_client()
             # Ensure category exists and has configured save_path
@@ -158,7 +203,23 @@ class QBittorrentClient:
                 torrent_hash = None
                 if hasattr(result, "added_torrent_ids") and result.added_torrent_ids:
                     torrent_hash = result.added_torrent_ids[0]
+                elif isinstance(result, dict) and "added_torrent_ids" in result:
+                    ids = result["added_torrent_ids"]
+                    if ids:
+                        torrent_hash = ids[0]
+
+                if not torrent_hash:
+                    # Fallback: check most recently added torrent in this category
+                    try:
+                        time.sleep(0.5)
+                        recent = client.torrents_info(category=self.category, limit=3, sort="added_on", reverse=True)
+                        if recent:
+                            torrent_hash = recent[0].hash
+                    except Exception as e:
+                        logger.debug("Could not determine torrent hash from recent torrents: %s", e)
+
                 if torrent_hash:
+                    time.sleep(0.5)
                     self.rename_torrent_content(torrent_hash, custom_name)
 
             return True
