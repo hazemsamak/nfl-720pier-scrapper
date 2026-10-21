@@ -618,6 +618,39 @@ class TestNFLGrabber(unittest.TestCase):
             self.assertFalse(duplicate)
             self.assertEqual(db.get_processed_count(), 1)
 
+            # Insert another record without rating
+            db.record_processed_torrent(
+                torrent_id="https://720pier.ru/download/102",
+                title="LAC at KC",
+                week="Week 6",
+                rating=None,
+            )
+            records = {r["torrent_url"]: r for r in db.get_processed_torrents()}
+            self.assertIsNone(records["https://720pier.ru/download/102"]["rating"])
+
+            # Test update_torrent_rating
+            updated = db.update_torrent_rating("https://720pier.ru/download/102", "29")
+            self.assertTrue(updated)
+            records = {r["torrent_url"]: r for r in db.get_processed_torrents()}
+            self.assertEqual(records["https://720pier.ru/download/102"]["rating"], "29")
+
+            # Duplicate insert with rating backfill
+            db.record_processed_torrent(
+                torrent_id="https://720pier.ru/download/103",
+                title="ARI at LAR",
+                week="Week 6",
+            )
+            # Duplicate call passes rating="100"
+            res = db.record_processed_torrent(
+                torrent_id="https://720pier.ru/download/103",
+                title="ARI at LAR",
+                week="Week 6",
+                rating="100",
+            )
+            self.assertFalse(res)
+            records = {r["torrent_url"]: r for r in db.get_processed_torrents()}
+            self.assertEqual(records["https://720pier.ru/download/103"]["rating"], "100")
+
             db.close()
 
     def test_database_manager_migration_from_json(self):

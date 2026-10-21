@@ -278,6 +278,8 @@ def execute_grabber_cycle(
             fav_tag = " [FAVORITE TEAM: KC]" if t.get("is_favorite_team") else ""
 
             if state.is_torrent_processed(torrent_url) and not dry_run:
+                if rating != "N/A" and hasattr(state, "update_torrent_rating"):
+                    state.update_torrent_rating(torrent_url, str(rating))
                 logger.info("Skipping already processed torrent: [%s pts]%s %s", rating, fav_tag, title)
                 continue
 
@@ -320,7 +322,12 @@ def execute_grabber_cycle(
             try:
                 success = qbit.add_torrent_file(torrent_bytes, filename, custom_name=custom_name)
                 if success:
-                    state.record_processed_torrent(torrent_url, title, week_title)
+                    state.record_processed_torrent(
+                        torrent_url,
+                        title,
+                        week_title,
+                        rating=str(rating) if rating != "N/A" else None,
+                    )
                     newly_added.append(t)
                     logger.info("Successfully added torrent to qBittorrent: %s", filename)
                 else:

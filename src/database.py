@@ -157,6 +157,7 @@ class DatabaseManager:
         """
         Records a newly processed torrent.
         Returns True if inserted, False if it was already processed.
+        If already processed but rating is missing, updates the rating.
         """
         now_str = datetime.now(timezone.utc).isoformat()
         try:
@@ -172,7 +173,32 @@ class DatabaseManager:
                 self.set_metadata("last_run_timestamp", now_str)
                 return cur.rowcount > 0
         except sqlite3.IntegrityError:
+            if rating:
+                with self._conn:
+                    self._conn.execute(
+                        """
+                        UPDATE processed_torrents
+                        SET rating = ?
+                        WHERE torrent_url = ? AND (rating IS NULL OR rating = '' OR rating = 'N/A')
+                        """,
+                        (str(rating), torrent_id),
+                    )
             return False
+
+    def update_torrent_rating(self, torrent_id: str, rating: str) -> bool:
+        """Updates the rating for a torrent if it is currently empty or missing."""
+        if not rating or rating == "N/A":
+            return False
+        with self._conn:
+            cur = self._conn.execute(
+                """
+                UPDATE processed_torrents
+                SET rating = ?
+                WHERE (torrent_url = ? OR id = ?) AND (rating IS NULL OR rating = '' OR rating = 'N/A')
+                """,
+                (str(rating), str(torrent_id), int(torrent_id) if str(torrent_id).isdigit() else -1),
+            )
+            return cur.rowcount > 0
 
     def get_processed_count(self) -> int:
         """Returns total number of processed torrents."""
