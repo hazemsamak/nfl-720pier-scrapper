@@ -79,22 +79,46 @@ def is_scheduled_day(allowed_days: Optional[List[str]], dt: Optional[datetime] =
 
 def calculate_next_run_time(
     allowed_days: Optional[List[str]],
-    interval_hours: float,
+    interval_hours: Optional[float] = None,
     current_dt: Optional[datetime] = None,
+    schedule_times: Optional[List[str]] = None,
 ) -> datetime:
     """
-    Calculates the exact next datetime when the grabber will actively run based on schedule days and interval.
-    If the next interval step lands on an excluded day (e.g. Thu-Sun), it projects forward
-    to the first interval tick on the next allowed day (e.g. Monday).
+    Calculates the exact next datetime when the grabber will actively run based on schedule days and times.
+    If schedule_times is provided (e.g. ['09:00', '15:00', '21:00']), it calculates the next time slot
+    on the current or next allowed day.
+    Otherwise, falls back to interval-based calculation using interval_hours.
     """
-    from datetime import timedelta
+    from datetime import timedelta, time
+
+    base_dt = current_dt or datetime.now()
+
+    if schedule_times:
+        parsed_times = []
+        for t in schedule_times:
+            if not t or ":" not in t:
+                continue
+            parts = [int(p) for p in t.split(":")]
+            parsed_times.append((parts[0], parts[1]))
+        parsed_times.sort()
+
+        if parsed_times:
+            # Look ahead up to 30 days
+            for day_offset in range(30):
+                check_date = base_dt.date() + timedelta(days=day_offset)
+                check_dt_day = datetime.combine(check_date, time(0, 0, 0))
+                if allowed_days and not is_scheduled_day(allowed_days, check_dt_day):
+                    continue
+                for h, m in parsed_times:
+                    candidate = datetime.combine(check_date, time(h, m, 0))
+                    if candidate > base_dt:
+                        return candidate
 
     try:
-        hours_val = float(interval_hours)
+        hours_val = float(interval_hours if interval_hours is not None else 6.0)
     except (TypeError, ValueError):
         hours_val = 6.0
 
-    base_dt = current_dt or datetime.now()
     step_delta = timedelta(hours=max(0.1, hours_val))
     candidate = base_dt + step_delta
 
@@ -347,7 +371,11 @@ def execute_grabber_cycle(
                     context={"Match": title, "File": filename},
                 )
 
-        next_run_dt = calculate_next_run_time(config.schedule_days, config.check_interval_hours)
+        next_run_dt = calculate_next_run_time(
+            config.schedule_days,
+            interval_hours=config.check_interval_hours,
+            schedule_times=getattr(config, "schedule_times", None),
+        )
         next_run_str = f"{next_run_dt.strftime('%A, %b %d at %H:%M')} ({format_relative_time(next_run_dt)})"
 
         if run_id and hasattr(state, "record_run_completion") and not dry_run:
@@ -409,9 +437,16 @@ def main():
 
     interval_hours = max(0.1, config.check_interval_hours)
     days_label = ", ".join(config.schedule_days) if config.schedule_days else "Everyday"
+    schedule_times = getattr(config, "schedule_times", None)
+    times_label = ", ".join(schedule_times) if schedule_times else f"every {interval_hours:.1f}h"
 
     def log_next_run(base_dt=None):
-        next_dt = calculate_next_run_time(config.schedule_days, interval_hours, current_dt=base_dt)
+        next_dt = calculate_next_run_time(
+            config.schedule_days,
+            interval_hours=interval_hours,
+            schedule_times=schedule_times,
+            current_dt=base_dt,
+        )
         rel_str = format_relative_time(next_dt, base_dt=base_dt)
         formatted_next = f"{next_dt.strftime('%A, %Y-%m-%d %H:%M:%S')} ({rel_str})"
         update_service_status(next_run=formatted_next, status="Running")
@@ -442,13 +477,6 @@ def main():
         execute_grabber_cycle(config, state, notifier, dry_run=args.dry_run)
         sys.exit(0)
 
-    # Scheduled mode
-    logger.info(
-        "Running in scheduled service mode on [%s] every %.2f hour(s). Press Ctrl+C to terminate.",
-        days_label,
-        interval_hours,
-    )
-
     def run_scheduled_cycle():
         current_day_name = datetime.now().strftime("%A")
         if not is_scheduled_day(config.schedule_days):
@@ -461,27 +489,51 @@ def main():
             return 0
         from src.web import run_cycle_synchronized
         success, _ = run_cycle_synchronized(dry_run=False, caller="scheduler")
+        log_next_run()
         return 1 if success else 0
 
-    # Initial run on startup (only if today is an active scheduled day)
-    today_name = datetime.now().strftime("%A")
-    if is_scheduled_day(config.schedule_days):
-        logger.info("Today (%s) is an active scheduled run day. Running initial grabber cycle...", today_name)
-        from src.web import run_cycle_synchronized
-        run_cycle_synchronized(dry_run=False, caller="startup")
+    # Scheduled mode
+    if schedule_times:
+        logger.info(
+            "Running in scheduled service mode on [%s] at [%s]. Press Ctrl+C to terminate.",
+            days_label,
+            times_label,
+        )
+        for t_str in schedule_times:
+            schedule.every().day.at(t_str).do(run_scheduled_cycle)
     else:
         logger.info(
-            "Service started. Today (%s) is outside scheduled active days (%s). Standing by for next interval check.",
-            today_name,
+            "Running in scheduled service mode on [%s] every %.2f hour(s). Press Ctrl+C to terminate.",
             days_label,
+            interval_hours,
+        )
+        schedule.every(interval_hours).hours.do(run_scheduled_cycle)
+
+    # Initial run on startup (only if RUN_ON_STARTUP is enabled)
+    today_name = datetime.now().strftime("%A")
+    if getattr(config, "run_on_startup", False):
+        if is_scheduled_day(config.schedule_days):
+            logger.info("Today (%s) is an active scheduled run day. Running initial grabber cycle...", today_name)
+            from src.web import run_cycle_synchronized
+            run_cycle_synchronized(dry_run=False, caller="startup")
+        else:
+            logger.info(
+                "Service started. Today (%s) is outside scheduled active days (%s). Standing by for next scheduled run.",
+                today_name,
+                days_label,
+            )
+    else:
+        logger.info(
+            "Service started in scheduled mode on [%s] at [%s]. Standing by for next scheduled run.",
+            days_label,
+            times_label,
         )
 
     log_next_run()
-    schedule.every(interval_hours).hours.do(run_scheduled_cycle)
 
     while running:
         schedule.run_pending()
-        time.sleep(10)
+        time.sleep(1)
 
     logger.info("NFL Grabber service terminated.")
 

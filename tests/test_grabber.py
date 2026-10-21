@@ -198,7 +198,26 @@ class TestNFLGrabber(unittest.TestCase):
         self.assertIsNotNone(config.qbit_host)
         self.assertEqual(config.qbit_save_path, "/nfl")
         self.assertEqual(config.schedule_days, ["Mon", "Tue", "Wed"])
+        self.assertEqual(config.schedule_times, ["09:00", "15:00", "21:00"])
+        self.assertFalse(config.run_on_startup)
         self.assertIsInstance(config.check_interval_hours, float)
+
+    def test_normalize_schedule_time(self):
+        from src.config import normalize_schedule_time
+
+        self.assertEqual(normalize_schedule_time("9 AM"), "09:00")
+        self.assertEqual(normalize_schedule_time("9am"), "09:00")
+        self.assertEqual(normalize_schedule_time("3 PM"), "15:00")
+        self.assertEqual(normalize_schedule_time("3pm"), "15:00")
+        self.assertEqual(normalize_schedule_time("9 PM"), "21:00")
+        self.assertEqual(normalize_schedule_time("9pm"), "21:00")
+        self.assertEqual(normalize_schedule_time("09:00"), "09:00")
+        self.assertEqual(normalize_schedule_time("15:00"), "15:00")
+        self.assertEqual(normalize_schedule_time("21:00"), "21:00")
+        self.assertEqual(normalize_schedule_time("12 AM"), "00:00")
+        self.assertEqual(normalize_schedule_time("12 PM"), "12:00")
+        self.assertIsNone(normalize_schedule_time("invalid"))
+        self.assertIsNone(normalize_schedule_time("25:00"))
 
     def test_is_scheduled_day(self):
         from datetime import datetime
@@ -805,7 +824,38 @@ class TestNFLGrabber(unittest.TestCase):
         from src.main import calculate_next_run_time
 
         allowed_days = ["Mon", "Tue", "Wed"]
+        schedule_times = ["09:00", "15:00", "21:00"]
 
+        # Wednesday 15:31:56 -> Wed 21:00
+        t_wed_mid = datetime(2026, 10, 21, 15, 31, 56)
+        next_wed = calculate_next_run_time(allowed_days, schedule_times=schedule_times, current_dt=t_wed_mid)
+        self.assertEqual(next_wed, datetime(2026, 10, 21, 21, 0, 0))
+
+        # Wednesday 21:00:01 -> Next allowed day is Monday 09:00
+        t_wed_late = datetime(2026, 10, 21, 21, 0, 1)
+        next_mon = calculate_next_run_time(allowed_days, schedule_times=schedule_times, current_dt=t_wed_late)
+        self.assertEqual(next_mon, datetime(2026, 10, 26, 9, 0, 0))
+
+        # Sunday 14:00 (non-active day) -> Monday 09:00
+        t_sun = datetime(2026, 10, 25, 14, 0, 0)
+        next_from_sun = calculate_next_run_time(allowed_days, schedule_times=schedule_times, current_dt=t_sun)
+        self.assertEqual(next_from_sun, datetime(2026, 10, 26, 9, 0, 0))
+
+        # Monday 08:30 -> Monday 09:00
+        t_mon_early = datetime(2026, 10, 26, 8, 30, 0)
+        next_mon_early = calculate_next_run_time(allowed_days, schedule_times=schedule_times, current_dt=t_mon_early)
+        self.assertEqual(next_mon_early, datetime(2026, 10, 26, 9, 0, 0))
+
+        # Monday 10:00 -> Monday 15:00
+        t_mon_mid = datetime(2026, 10, 26, 10, 0, 0)
+        next_mon_afternoon = calculate_next_run_time(allowed_days, schedule_times=schedule_times, current_dt=t_mon_mid)
+        self.assertEqual(next_mon_afternoon, datetime(2026, 10, 26, 15, 0, 0))
+
+        # No day restrictions -> next tick directly (e.g. Wednesday 21:05 -> Thursday 09:00)
+        next_daily = calculate_next_run_time([], schedule_times=schedule_times, current_dt=t_wed_late)
+        self.assertEqual(next_daily, datetime(2026, 10, 22, 9, 0, 0))
+
+        # Fallback interval mode (no schedule_times provided):
         # Monday 10:00 with 6 hour interval -> Monday 16:00
         t1 = datetime(2026, 10, 12, 10, 0, 0)
         next1 = calculate_next_run_time(allowed_days, 6.0, current_dt=t1)
@@ -817,7 +867,7 @@ class TestNFLGrabber(unittest.TestCase):
         self.assertEqual(next2.strftime("%A"), "Monday")
         self.assertEqual(next2, datetime(2026, 10, 19, 2, 0, 0))
 
-        # No day restrictions -> next tick directly
+        # No day restrictions with interval -> next tick directly
         next_any = calculate_next_run_time([], 6.0, current_dt=t2)
         self.assertEqual(next_any, datetime(2026, 10, 15, 2, 0, 0))
 

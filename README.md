@@ -80,9 +80,10 @@ QBIT_CATEGORY=NFL
 QBIT_TAGS=720pier,thuuz
 QBIT_SAVE_PATH=/nfl
 
-# Service Schedule (Mon, Tue, Wed every 6 hours)
+# Service Schedule (Mon, Tue, Wed at 9 AM, 3 PM, and 9 PM)
 SCHEDULE_DAYS=Mon,Tue,Wed
-CHECK_INTERVAL_HOURS=6
+SCHEDULE_TIMES=09:00,15:00,21:00
+RUN_ON_STARTUP=false
 RENAME_TORRENT_FILES=true
 ```
 
