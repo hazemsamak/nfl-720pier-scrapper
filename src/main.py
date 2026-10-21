@@ -393,11 +393,6 @@ def main():
     args = parser.parse_args()
 
     config = Config.load()
-
-    # Start embedded lightweight web log viewer server
-    if getattr(config, "web_enabled", True):
-        start_web_server(port=config.web_port, db_path=config.db_path)
-
     state = DatabaseManager(db_path=config.db_path, legacy_json_path=config.state_file_path)
     notifier = Notifier(
         discord_webhook_url=config.discord_webhook_url,
@@ -405,22 +400,8 @@ def main():
         telegram_chat_id=config.telegram_chat_id,
     )
 
-    signal.signal(signal.SIGINT, handle_shutdown)
-    signal.signal(signal.SIGTERM, handle_shutdown)
-
-    if args.dry_run or args.once:
-        logger.info("Running in one-shot mode%s.", " (DRY RUN)" if args.dry_run else "")
-        execute_grabber_cycle(config, state, notifier, dry_run=args.dry_run)
-        sys.exit(0)
-
-    # Scheduled mode
     interval_hours = max(0.1, config.check_interval_hours)
     days_label = ", ".join(config.schedule_days) if config.schedule_days else "Everyday"
-    logger.info(
-        "Running in scheduled service mode on [%s] every %.2f hour(s). Press Ctrl+C to terminate.",
-        days_label,
-        interval_hours,
-    )
 
     def log_next_run(base_dt=None):
         next_dt = calculate_next_run_time(config.schedule_days, interval_hours, current_dt=base_dt)
@@ -434,6 +415,33 @@ def main():
         )
         return next_dt
 
+    # Start embedded lightweight web log viewer & control server
+    if getattr(config, "web_enabled", True):
+        start_web_server(
+            port=config.web_port,
+            db_path=config.db_path,
+            config=config,
+            state=state,
+            notifier=notifier,
+            cycle_runner=lambda dry_run=False: execute_grabber_cycle(config, state, notifier, dry_run=dry_run),
+            schedule_logger=log_next_run,
+        )
+
+    signal.signal(signal.SIGINT, handle_shutdown)
+    signal.signal(signal.SIGTERM, handle_shutdown)
+
+    if args.dry_run or args.once:
+        logger.info("Running in one-shot mode%s.", " (DRY RUN)" if args.dry_run else "")
+        execute_grabber_cycle(config, state, notifier, dry_run=args.dry_run)
+        sys.exit(0)
+
+    # Scheduled mode
+    logger.info(
+        "Running in scheduled service mode on [%s] every %.2f hour(s). Press Ctrl+C to terminate.",
+        days_label,
+        interval_hours,
+    )
+
     def run_scheduled_cycle():
         current_day_name = datetime.now().strftime("%A")
         if not is_scheduled_day(config.schedule_days):
@@ -444,20 +452,16 @@ def main():
             )
             log_next_run()
             return 0
-        update_service_status(status="Active Cycle Running")
-        res = execute_grabber_cycle(config, state, notifier)
-        update_service_status(
-            status="Running",
-            last_run=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        )
-        log_next_run()
-        return res
+        from src.web import run_cycle_synchronized
+        success, _ = run_cycle_synchronized(dry_run=False, caller="scheduler")
+        return 1 if success else 0
 
     # Initial run on startup (only if today is an active scheduled day)
     today_name = datetime.now().strftime("%A")
     if is_scheduled_day(config.schedule_days):
         logger.info("Today (%s) is an active scheduled run day. Running initial grabber cycle...", today_name)
-        execute_grabber_cycle(config, state, notifier)
+        from src.web import run_cycle_synchronized
+        run_cycle_synchronized(dry_run=False, caller="startup")
     else:
         logger.info(
             "Service started. Today (%s) is outside scheduled active days (%s). Standing by for next interval check.",

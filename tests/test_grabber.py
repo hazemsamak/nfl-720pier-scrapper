@@ -691,6 +691,82 @@ class TestNFLGrabber(unittest.TestCase):
 
             db.close()
 
+    def test_database_manager_delete_and_list(self):
+        from src.database import DatabaseManager
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "delete_test.db")
+            db = DatabaseManager(db_path=db_path, legacy_json_path=None)
+
+            db.record_processed_torrent("https://720pier.ru/download/1", "Match 1", "Week 1", "95")
+            db.record_processed_torrent("https://720pier.ru/download/2", "Match 2", "Week 1", "90")
+            db.record_processed_torrent("https://720pier.ru/download/3", "Match 3", "Week 2", "88")
+
+            torrents = db.get_processed_torrents()
+            self.assertEqual(len(torrents), 3)
+
+            # Delete by torrent URL
+            del_url = db.delete_processed_torrent("https://720pier.ru/download/1")
+            self.assertTrue(del_url)
+            self.assertFalse(db.is_torrent_processed("https://720pier.ru/download/1"))
+            self.assertEqual(len(db.get_processed_torrents()), 2)
+
+            # Delete by ID
+            remaining = db.get_processed_torrents()
+            target_id = remaining[0]["id"]
+            del_id = db.delete_processed_torrent(str(target_id))
+            self.assertTrue(del_id)
+            self.assertEqual(len(db.get_processed_torrents()), 1)
+
+            # Non-existent delete
+            del_none = db.delete_processed_torrent("https://720pier.ru/download/999")
+            self.assertFalse(del_none)
+
+            db.close()
+
+    def test_notifier_send_test_notification(self):
+        from src.notifier import Notifier
+
+        # Unconfigured notifier
+        unconfigured = Notifier()
+        results = unconfigured.send_test_notification()
+        self.assertEqual(results["discord"], "Not configured")
+        self.assertEqual(results["telegram"], "Not configured")
+
+        # Configured notifier with mock
+        configured = Notifier(
+            discord_webhook_url="https://discord.com/api/webhooks/mock",
+            telegram_bot_token="tok",
+            telegram_chat_id="123",
+        )
+        with patch.object(configured, "send_discord", return_value=True), \
+             patch.object(configured, "send_telegram", return_value=True):
+            res = configured.send_test_notification()
+            self.assertTrue(res["discord"])
+            self.assertTrue(res["telegram"])
+
+    def test_web_coordinator_locking_and_trigger(self):
+        from src.web import run_cycle_synchronized, trigger_cycle_async, _service_context, _cycle_lock
+
+        mock_runner = MagicMock()
+        _service_context["cycle_runner"] = mock_runner
+
+        # Normal run
+        success, msg = run_cycle_synchronized(dry_run=True, caller="test")
+        self.assertTrue(success)
+        mock_runner.assert_called_once_with(dry_run=True)
+
+        # Verify collision lock
+        with _cycle_lock:
+            # While lock is held, new triggers should fail with 409-style message
+            fail_sync, fail_msg = run_cycle_synchronized(dry_run=False, caller="test2")
+            self.assertFalse(fail_sync)
+            self.assertIn("already in progress", fail_msg)
+
+            fail_async, async_msg = trigger_cycle_async(dry_run=False)
+            self.assertFalse(fail_async)
+            self.assertIn("already in progress", async_msg)
+
     def test_calculate_next_run_time(self):
         from datetime import datetime
         from src.main import calculate_next_run_time

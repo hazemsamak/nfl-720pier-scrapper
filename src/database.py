@@ -183,9 +183,41 @@ class DatabaseManager:
     def get_all_torrents(self) -> List[Dict[str, Any]]:
         """Returns list of all processed torrent dictionaries."""
         cur = self._conn.execute(
-            "SELECT torrent_url, title, week, rating, added_at FROM processed_torrents ORDER BY id ASC"
+            "SELECT id, torrent_url, title, week, rating, added_at FROM processed_torrents ORDER BY id DESC"
         )
         return [dict(row) for row in cur.fetchall()]
+
+    def get_processed_torrents(self, limit: int = 100, offset: int = 0) -> List[Dict[str, Any]]:
+        """Returns paginated processed torrents ordered by most recent first."""
+        cur = self._conn.execute(
+            """
+            SELECT id, torrent_url, title, week, rating, added_at
+            FROM processed_torrents
+            ORDER BY id DESC
+            LIMIT ? OFFSET ?
+            """,
+            (limit, offset),
+        )
+        return [dict(row) for row in cur.fetchall()]
+
+    def delete_processed_torrent(self, identifier: str) -> bool:
+        """
+        Deletes a processed torrent by database id or torrent_url.
+        Returns True if a record was removed, False otherwise.
+        """
+        with self._conn:
+            if str(identifier).isdigit():
+                cur = self._conn.execute("DELETE FROM processed_torrents WHERE id = ?", (int(identifier),))
+                if cur.rowcount > 0:
+                    return True
+            cur = self._conn.execute("DELETE FROM processed_torrents WHERE torrent_url = ?", (str(identifier),))
+            return cur.rowcount > 0
+
+    def delete_processed_torrents_by_week(self, week: str) -> int:
+        """Deletes all processed torrents for a given week. Returns count of removed rows."""
+        with self._conn:
+            cur = self._conn.execute("DELETE FROM processed_torrents WHERE week = ? OR week LIKE ?", (week, f"%{week}%"))
+            return cur.rowcount
 
     # --------------------------------------------------------------------------
     # Run Execution History

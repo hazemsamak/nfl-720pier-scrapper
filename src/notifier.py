@@ -1,7 +1,7 @@
 import logging
 import time
 from datetime import datetime, timezone
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 import requests
 
 logger = logging.getLogger(__name__)
@@ -165,6 +165,22 @@ class Notifier:
             lines.append(f"💡 *Action:* {suggestion}")
 
         return self.send_telegram("\n".join(lines))
+
+    def send_test_notification(self) -> Dict[str, Any]:
+        """Dispatches a test notification to configured channels and returns delivery status."""
+        results: Dict[str, Any] = {}
+        msg = "🏈 **NFL THUUZ Grabber Test Alert**: Notification pipeline is functioning correctly!"
+        if self.discord_webhook_url:
+            results["discord"] = self.send_discord(msg)
+        else:
+            results["discord"] = "Not configured"
+
+        if self.telegram_bot_token and self.telegram_chat_id:
+            results["telegram"] = self.send_telegram(msg)
+        else:
+            results["telegram"] = "Not configured"
+
+        return results
 
     def send_telegram(self, message: str) -> bool:
         """Sends a message via Telegram bot."""
