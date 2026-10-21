@@ -114,16 +114,25 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     }
 
     * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body {
+      height: 100%;
+      height: 100vh;
+      height: 100dvh;
+      margin: 0;
+      padding: 0;
+      overflow: hidden; /* Lock viewport and prevent whole-page stretching */
+    }
+
     body {
       background-color: var(--bg);
       color: var(--text);
       font-family: 'Inter', system-ui, -apple-system, sans-serif;
-      min-height: 100vh;
       display: flex;
       flex-direction: column;
     }
 
     header {
+      flex-shrink: 0;
       background-color: var(--card-bg);
       border-bottom: 1px solid var(--card-border);
       padding: 0.85rem 1.25rem;
@@ -178,6 +187,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
     /* Stats Ribbon */
     .stats-ribbon {
+      flex-shrink: 0;
       background: rgba(40, 42, 54, 0.75);
       border-bottom: 1px solid var(--card-border);
       display: flex;
@@ -206,6 +216,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
     /* Controls Bar */
     .controls-bar {
+      flex-shrink: 0;
       padding: 0.75rem 1.25rem;
       display: flex;
       flex-wrap: wrap;
@@ -308,6 +319,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     /* Terminal Container */
     .terminal-container {
       flex: 1;
+      min-height: 0; /* Crucial: allows flex container to shrink within viewport and enable inside scroll */
       margin: 0.75rem 1.25rem 1.25rem;
       background-color: #14151c;
       border: 1px solid var(--card-border);
@@ -319,6 +331,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     }
 
     .terminal-header {
+      flex-shrink: 0;
       background-color: #1c1d27;
       padding: 0.5rem 0.85rem;
       display: flex;
@@ -346,30 +359,40 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
     #log-stream {
       flex: 1;
+      min-height: 0; /* Crucial for scroll container inside flexbox */
       padding: 0.85rem 1rem;
-      overflow-y: auto;
+      overflow-y: scroll; /* Forces inside scroll bar to be available */
+      overflow-x: hidden;
       font-family: 'Fira Code', monospace;
       font-size: 0.82rem;
       line-height: 1.5;
       color: var(--text);
       white-space: pre-wrap;
       word-break: break-all;
+      scrollbar-width: thin;
+      scrollbar-color: var(--card-border) #14151c;
     }
 
     #log-stream::-webkit-scrollbar {
-      width: 8px;
+      width: 10px;
     }
     #log-stream::-webkit-scrollbar-track {
       background: #14151c;
+      border-radius: 4px;
     }
     #log-stream::-webkit-scrollbar-thumb {
       background: var(--card-border);
-      border-radius: 4px;
+      border-radius: 5px;
+      border: 2px solid #14151c;
+    }
+    #log-stream::-webkit-scrollbar-thumb:hover {
+      background: var(--muted);
     }
 
     .log-line {
       display: block;
-      padding: 0.1rem 0;
+      padding: 0.12rem 0.25rem;
+      border-radius: 3px;
       transition: background 0.1s;
     }
     .log-line:hover {
@@ -448,7 +471,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         <div class="dot dot-yellow"></div>
         <div class="dot dot-green"></div>
       </div>
-      <div>docker://nfl-torrent-grabber/stdout</div>
+      <div>docker://nfl-torrent-grabber/stdout &bull; <span style="color: var(--cyan); font-weight: 500;">newest on top</span></div>
       <div id="connection-status" style="color: var(--green);">Connected</div>
     </div>
     <div id="log-stream"></div>
@@ -507,7 +530,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       const lines = streamEl.querySelectorAll('.log-line');
       lines.forEach(applyVisibility);
       if (autoScroll) {
-        streamEl.scrollTop = streamEl.scrollHeight;
+        streamEl.scrollTop = 0;
       }
     }
 
@@ -525,18 +548,29 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         if (data.total_logs !== undefined) document.getElementById('stat-log-count').textContent = data.total_logs + ' lines';
 
         if (data.logs && data.logs.length > 0) {
-          const frag = document.createDocumentFragment();
-          data.logs.forEach(entry => {
-            if (entry.id > lastSeenId) {
-              lastSeenId = entry.id;
-              allLogs.push(entry);
-              frag.appendChild(renderLogEntry(entry));
-            }
-          });
-          streamEl.appendChild(frag);
+          // Filter to new entries
+          const newEntries = data.logs.filter(entry => entry.id > lastSeenId);
+          if (newEntries.length > 0) {
+            // Sort new entries descending (newest ID first) so newest messages are at the top
+            newEntries.sort((a, b) => b.id - a.id);
+            const highestId = Math.max(...newEntries.map(e => e.id));
+            lastSeenId = highestId;
 
-          if (autoScroll) {
-            streamEl.scrollTop = streamEl.scrollHeight;
+            const frag = document.createDocumentFragment();
+            newEntries.forEach(entry => {
+              allLogs.unshift(entry);
+              frag.appendChild(renderLogEntry(entry));
+            });
+
+            if (streamEl.firstChild) {
+              streamEl.insertBefore(frag, streamEl.firstChild);
+            } else {
+              streamEl.appendChild(frag);
+            }
+
+            if (autoScroll) {
+              streamEl.scrollTop = 0;
+            }
           }
         }
         document.getElementById('connection-status').textContent = 'Live';
@@ -547,13 +581,30 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       }
     }
 
-    // Auto-scroll toggle
+    // Auto-scroll toggle (maintains scroll at top for latest messages)
     autoScrollBtn.addEventListener('click', () => {
       autoScroll = !autoScroll;
       autoScrollBtn.textContent = 'Auto-scroll: ' + (autoScroll ? 'ON' : 'OFF');
       autoScrollBtn.classList.toggle('active', autoScroll);
       if (autoScroll) {
-        streamEl.scrollTop = streamEl.scrollHeight;
+        streamEl.scrollTop = 0;
+      }
+    });
+
+    // Detect user manual scroll in the inside scroll container
+    streamEl.addEventListener('scroll', () => {
+      if (streamEl.scrollTop > 40) {
+        if (autoScroll) {
+          autoScroll = false;
+          autoScrollBtn.textContent = 'Auto-scroll: OFF';
+          autoScrollBtn.classList.remove('active');
+        }
+      } else if (streamEl.scrollTop <= 5) {
+        if (!autoScroll) {
+          autoScroll = true;
+          autoScrollBtn.textContent = 'Auto-scroll: ON';
+          autoScrollBtn.classList.add('active');
+        }
       }
     });
 
@@ -562,8 +613,11 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       streamEl.innerHTML = '';
     });
 
-    // Manual refresh
+    // Manual refresh (clears and reloads entire history newest-first)
     refreshBtn.addEventListener('click', () => {
+      streamEl.innerHTML = '';
+      lastSeenId = 0;
+      allLogs = [];
       fetchLogs();
     });
 
@@ -648,8 +702,10 @@ class LogRequestHandler(http.server.BaseHTTPRequestHandler):
 
         elif path == "/logs":
             is_download = "download" in params
+            reverse_order = "reverse" in params or "desc" in params
             with _log_lock:
-                text_content = "\n".join(e["raw"] for e in log_buffer) + "\n"
+                raw_entries = list(reversed(log_buffer)) if reverse_order else log_buffer
+                text_content = "\n".join(e["raw"] for e in raw_entries) + "\n"
 
             self.send_response(200)
             self.send_header("Content-Type", "text/plain; charset=utf-8")
