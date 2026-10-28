@@ -69,7 +69,11 @@ def get_total_grabbed_torrents(db_path: Optional[str] = None) -> int:
         return 0
 
 
-def run_cycle_synchronized(dry_run: bool = False, caller: str = "scheduler") -> tuple[bool, str]:
+def run_cycle_synchronized(
+    dry_run: bool = False,
+    caller: str = "scheduler",
+    favorite_only: Optional[bool] = None,
+) -> tuple[bool, str]:
     """
     Executes a grabber cycle under an exclusive lock.
     Prevents overlapping execution between scheduled and manual runs.
@@ -85,7 +89,7 @@ def run_cycle_synchronized(dry_run: bool = False, caller: str = "scheduler") -> 
         update_service_status(status="Active Cycle Running", is_cycle_running=True)
         runner = _service_context.get("cycle_runner")
         if runner:
-            runner(dry_run=dry_run)
+            runner(dry_run=dry_run, favorite_only=favorite_only)
         update_service_status(
             status="Running",
             last_run=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -107,14 +111,14 @@ def run_cycle_synchronized(dry_run: bool = False, caller: str = "scheduler") -> 
         update_service_status(is_cycle_running=False)
 
 
-def trigger_cycle_async(dry_run: bool = False) -> tuple[bool, str]:
+def trigger_cycle_async(dry_run: bool = False, favorite_only: bool = False) -> tuple[bool, str]:
     """Spawns an asynchronous grabber cycle in a daemon thread if lock is free."""
     if _cycle_lock.locked():
         return False, "Grabber cycle already in progress"
 
     t = threading.Thread(
         target=run_cycle_synchronized,
-        kwargs={"dry_run": dry_run, "caller": "web_ui"},
+        kwargs={"dry_run": dry_run, "caller": "web_ui", "favorite_only": favorite_only},
         daemon=True,
         name="ManualGrabberCycle",
     )
@@ -726,101 +730,22 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       color: var(--green);
     }
 
-    /* Terminal View */
-    .terminal-container {
-      flex: 1;
-      min-height: 0;
-      margin: 0.6rem 1.25rem 1rem;
-      background-color: #14151c;
-      border: 1px solid var(--card-border);
-      border-radius: 8px;
-      display: flex;
-      flex-direction: column;
-      overflow: hidden;
-      box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
-    }
-
-    .terminal-header {
-      flex-shrink: 0;
-      background-color: #1c1d27;
-      padding: 0.45rem 0.85rem;
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      border-bottom: 1px solid rgba(68, 71, 90, 0.6);
-      font-size: 0.72rem;
-      color: var(--muted);
-      font-family: 'Fira Code', monospace;
-    }
-
-    .window-dots {
-      display: flex;
-      gap: 5px;
-    }
-
-    .dot {
-      width: 9px;
-      height: 9px;
-      border-radius: 50%;
-    }
-    .dot-red { background: #ff5555; }
-    .dot-yellow { background: #f1fa8c; }
-    .dot-green { background: #50fa7b; }
-
-    #log-stream {
-      flex: 1;
-      min-height: 0;
-      padding: 0.85rem 1rem;
-      overflow-y: scroll;
-      overflow-x: hidden;
-      font-family: 'Fira Code', monospace;
-      font-size: 0.81rem;
-      line-height: 1.5;
-      color: var(--text);
-      white-space: pre-wrap;
-      word-break: break-all;
-      scrollbar-width: thin;
-      scrollbar-color: var(--card-border) #14151c;
-    }
-
-    #log-stream::-webkit-scrollbar,
     .table-scroll-container::-webkit-scrollbar {
       width: 10px;
       height: 10px;
     }
-    #log-stream::-webkit-scrollbar-track,
     .table-scroll-container::-webkit-scrollbar-track {
       background: #14151c;
       border-radius: 4px;
     }
-    #log-stream::-webkit-scrollbar-thumb,
     .table-scroll-container::-webkit-scrollbar-thumb {
       background: var(--card-border);
       border-radius: 5px;
       border: 2px solid #14151c;
     }
-    #log-stream::-webkit-scrollbar-thumb:hover,
     .table-scroll-container::-webkit-scrollbar-thumb:hover {
       background: var(--muted);
     }
-
-    .log-line {
-      display: block;
-      padding: 0.12rem 0.25rem;
-      border-radius: 3px;
-      transition: background 0.1s;
-    }
-    .log-line:hover {
-      background: rgba(68, 71, 90, 0.3);
-    }
-
-    .log-time { color: var(--muted); margin-right: 0.5rem; }
-    .log-lvl { font-weight: 700; margin-right: 0.5rem; }
-    .log-lvl-INFO { color: var(--cyan); }
-    .log-lvl-WARNING { color: var(--orange); }
-    .log-lvl-ERROR { color: var(--red); }
-    .log-logger { color: var(--purple); margin-right: 0.4rem; }
-    .log-msg { color: var(--text); }
 
     /* Tables (Matches & History) */
     .table-container {
@@ -982,10 +907,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   <!-- Persistent Action Toolbar -->
   <div class="action-toolbar">
     <div class="tabs-group">
-      <button class="tab-btn active" data-tab="tab-logs">
-        <span>📋</span> Live Logs
-      </button>
-      <button class="tab-btn" data-tab="tab-matches">
+      <button class="tab-btn active" data-tab="tab-matches">
         <span>🏈</span> Grabbed Matches
         <span class="tab-counter" id="tab-count-torrents">0</span>
       </button>
@@ -1024,44 +946,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   <!-- Tab Content Area -->
   <div class="tab-content-area">
 
-    <!-- TAB 1: Live Logs -->
-    <div class="tab-pane active" id="tab-logs">
-      <div class="sub-bar">
-        <div class="search-box">
-          <input type="text" id="search-input" placeholder="Search / filter logs...">
-        </div>
-
-        <div class="filter-pills">
-          <button class="pill-btn active" data-lvl="ALL">ALL</button>
-          <button class="pill-btn" data-lvl="INFO">INFO</button>
-          <button class="pill-btn" data-lvl="WARNING">WARN</button>
-          <button class="pill-btn" data-lvl="ERROR">ERROR</button>
-        </div>
-
-        <div style="display: flex; align-items: center; gap: 0.4rem; margin-left: auto;">
-          <button class="btn-sm active" id="btn-autoscroll">Auto-scroll: ON</button>
-          <button class="btn-sm" id="btn-clear-logs">Clear View</button>
-          <a class="btn-sm" href="/logs?download=1" download="nfl_grabber.log">Download</a>
-          <button class="btn-sm" id="btn-refresh-logs">Refresh</button>
-        </div>
-      </div>
-
-      <div class="terminal-container">
-        <div class="terminal-header">
-          <div class="window-dots">
-            <div class="dot dot-red"></div>
-            <div class="dot dot-yellow"></div>
-            <div class="dot dot-green"></div>
-          </div>
-          <div>docker://nfl-torrent-grabber/stdout &bull; <span style="color: var(--cyan); font-weight: 500;">newest on top</span></div>
-          <div id="connection-status" style="color: var(--green);">Connected</div>
-        </div>
-        <div id="log-stream"></div>
-      </div>
-    </div>
-
-    <!-- TAB 2: Grabbed Matches -->
-    <div class="tab-pane" id="tab-matches">
+    <!-- TAB 1: Grabbed Matches -->
+    <div class="tab-pane active" id="tab-matches">
       <div class="sub-bar">
         <div class="search-box">
           <input type="text" id="matches-search" placeholder="Filter matches by team or week...">
@@ -1092,7 +978,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       </div>
     </div>
 
-    <!-- TAB 3: Run History -->
+    <!-- TAB 2: Run History -->
     <div class="tab-pane" id="tab-history">
       <div class="sub-bar">
         <div style="font-size: 0.78rem; color: var(--muted);" id="history-summary">Recent execution cycles recorded in SQLite</div>
@@ -1129,19 +1015,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
   <script>
     // State variables
-    let allLogs = [];
-    let lastSeenId = 0;
-    let autoScroll = true;
-    let currentFilter = 'ALL';
-    let searchQuery = '';
     let matchesData = [];
+    let previousCycleRunning = false;
 
     // Elements
-    const streamEl = document.getElementById('log-stream');
-    const searchInput = document.getElementById('search-input');
-    const autoScrollBtn = document.getElementById('btn-autoscroll');
-    const clearBtn = document.getElementById('btn-clear-logs');
-    const refreshBtn = document.getElementById('btn-refresh-logs');
     const runBtn = document.getElementById('btn-run-now');
     const runCaret = document.getElementById('btn-run-caret');
     const runDropdown = document.getElementById('run-dropdown-menu');
@@ -1166,9 +1043,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       }, duration);
     }
 
-    // -------------------------------------------------------------------------
     // Tab Switching
-    // -------------------------------------------------------------------------
     document.querySelectorAll('.tab-btn').forEach(btn => {
       btn.addEventListener('click', () => {
         document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
@@ -1183,9 +1058,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       });
     });
 
-    // -------------------------------------------------------------------------
     // Execution Dropdown & Triggers
-    // -------------------------------------------------------------------------
     runCaret.addEventListener('click', (e) => {
       e.stopPropagation();
       runDropdown.classList.toggle('show');
@@ -1205,8 +1078,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         const data = await res.json();
         if (res.status === 202) {
           showToast(data.message || 'Cycle successfully started in background!', 'success');
-          // Switch to logs tab to view progress immediately
-          document.querySelector('[data-tab="tab-logs"]').click();
         } else if (res.status === 409) {
           showToast(data.error || 'A grabber cycle is already in progress.', 'warning');
         } else {
@@ -1215,7 +1086,11 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       } catch (err) {
         showToast('Network error triggering grabber cycle: ' + err.message, 'error');
       } finally {
-        setTimeout(fetchLogs, 500);
+        setTimeout(() => {
+          fetchStatus();
+          fetchMatches();
+          fetchHistory();
+        }, 600);
       }
     }
 
@@ -1223,9 +1098,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     document.getElementById('btn-opt-live').addEventListener('click', () => triggerCycle(false));
     document.getElementById('btn-opt-dryrun').addEventListener('click', () => triggerCycle(true));
 
-    // -------------------------------------------------------------------------
-    // Diagnostic Buttons
-    // -------------------------------------------------------------------------
+    // Diagnostics
     document.getElementById('btn-diag-qbit').addEventListener('click', async () => {
       const btn = document.getElementById('btn-diag-qbit');
       btn.disabled = true;
@@ -1288,165 +1161,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       }
     });
 
-    // -------------------------------------------------------------------------
-    // Log Stream Functions
-    // -------------------------------------------------------------------------
-    function renderLogEntry(entry) {
-      const line = document.createElement('div');
-      line.className = 'log-line';
-      line.dataset.level = entry.level;
-      line.dataset.id = entry.id;
-
-      const lvlClass = 'log-lvl-' + (entry.level || 'INFO');
-      line.innerHTML = `<span class="log-time">${escapeHtml(entry.timestamp)}</span>` +
-                       `<span class="log-lvl ${lvlClass}">[${escapeHtml(entry.level)}]</span>` +
-                       `<span class="log-logger">${escapeHtml(entry.logger)}:</span>` +
-                       `<span class="log-msg">${escapeHtml(entry.message)}</span>`;
-
-      applyVisibility(line);
-      return line;
-    }
-
-    function applyVisibility(lineEl) {
-      const lvl = lineEl.dataset.level || '';
-      const text = lineEl.textContent.toLowerCase();
-
-      let visible = true;
-      if (currentFilter !== 'ALL' && lvl !== currentFilter) {
-        visible = false;
-      }
-      if (searchQuery && !text.includes(searchQuery)) {
-        visible = false;
-      }
-
-      lineEl.style.display = visible ? 'block' : 'none';
-    }
-
-    function refilterAll() {
-      const lines = streamEl.querySelectorAll('.log-line');
-      lines.forEach(applyVisibility);
-      if (autoScroll) {
-        streamEl.scrollTop = 0;
-      }
-    }
-
-    async function fetchLogs() {
-      try {
-        const res = await fetch(`/api/logs?since=${lastSeenId}`);
-        if (!res.ok) throw new Error('HTTP ' + res.status);
-        const data = await res.json();
-
-        // Update stats
-        const statusText = (data.status || 'Running').toUpperCase();
-        document.getElementById('badge-status-text').textContent = statusText;
-        const badgeWrap = document.getElementById('badge-status-wrap');
-        const isCycleRunning = data.is_cycle_running || statusText.includes('ACTIVE') || statusText.includes('RUNNING CYCLE');
-        badgeWrap.classList.toggle('running', isCycleRunning);
-
-        // Update trigger button states
-        if (isCycleRunning) {
-          runBtn.disabled = true;
-          document.getElementById('run-btn-icon').textContent = '⏳';
-          document.getElementById('run-btn-text').textContent = 'Cycle Running...';
-        } else {
-          runBtn.disabled = false;
-          document.getElementById('run-btn-icon').textContent = '▶';
-          document.getElementById('run-btn-text').textContent = 'Run Check Now';
-        }
-
-        if (data.next_run) document.getElementById('stat-next-run').textContent = data.next_run;
-        if (data.last_run) document.getElementById('stat-last-run').textContent = data.last_run;
-        if (data.active_week) document.getElementById('stat-active-week').textContent = data.active_week;
-        if (data.total_torrents !== undefined) {
-          document.getElementById('stat-total-torrents').textContent = data.total_torrents;
-          document.getElementById('tab-count-torrents').textContent = data.total_torrents;
-        }
-
-        if (data.logs && data.logs.length > 0) {
-          const newEntries = data.logs.filter(entry => entry.id > lastSeenId);
-          if (newEntries.length > 0) {
-            newEntries.sort((a, b) => b.id - a.id);
-            const highestId = Math.max(...newEntries.map(e => e.id));
-            lastSeenId = highestId;
-
-            const frag = document.createDocumentFragment();
-            newEntries.forEach(entry => {
-              allLogs.unshift(entry);
-              frag.appendChild(renderLogEntry(entry));
-            });
-
-            if (streamEl.firstChild) {
-              streamEl.insertBefore(frag, streamEl.firstChild);
-            } else {
-              streamEl.appendChild(frag);
-            }
-
-            if (autoScroll) {
-              streamEl.scrollTop = 0;
-            }
-          }
-        }
-        document.getElementById('connection-status').textContent = 'Live';
-        document.getElementById('connection-status').style.color = 'var(--green)';
-      } catch (err) {
-        document.getElementById('connection-status').textContent = 'Reconnecting...';
-        document.getElementById('connection-status').style.color = 'var(--orange)';
-      }
-    }
-
-    autoScrollBtn.addEventListener('click', () => {
-      autoScroll = !autoScroll;
-      autoScrollBtn.textContent = 'Auto-scroll: ' + (autoScroll ? 'ON' : 'OFF');
-      autoScrollBtn.classList.toggle('active', autoScroll);
-      if (autoScroll) {
-        streamEl.scrollTop = 0;
-      }
-    });
-
-    streamEl.addEventListener('scroll', () => {
-      if (streamEl.scrollTop > 40) {
-        if (autoScroll) {
-          autoScroll = false;
-          autoScrollBtn.textContent = 'Auto-scroll: OFF';
-          autoScrollBtn.classList.remove('active');
-        }
-      } else if (streamEl.scrollTop <= 5) {
-        if (!autoScroll) {
-          autoScroll = true;
-          autoScrollBtn.textContent = 'Auto-scroll: ON';
-          autoScrollBtn.classList.add('active');
-        }
-      }
-    });
-
-    clearBtn.addEventListener('click', () => {
-      streamEl.innerHTML = '';
-    });
-
-    refreshBtn.addEventListener('click', () => {
-      streamEl.innerHTML = '';
-      lastSeenId = 0;
-      allLogs = [];
-      fetchLogs();
-    });
-
-    searchInput.addEventListener('input', (e) => {
-      searchQuery = e.target.value.toLowerCase().trim();
-      refilterAll();
-    });
-
-    document.querySelectorAll('.pill-btn').forEach(btn => {
-      btn.addEventListener('click', () => {
-        document.querySelectorAll('.pill-btn').forEach(b => b.classList.remove('active'));
-        btn.classList.add('active');
-        currentFilter = btn.dataset.lvl;
-        refilterAll();
-      });
-    });
-
-    // -------------------------------------------------------------------------
-    // Grabbed Matches Management (TAB 2)
-    // -------------------------------------------------------------------------
+    // Grabbed Matches Management
     async function fetchMatches() {
       const tbody = document.getElementById('matches-tbody');
       try {
@@ -1503,7 +1218,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     }
 
     async function resetTorrent(id, title) {
-      if (!confirm(`Are you sure you want to remove this match from grabber memory?\\n\\n"${title}"\\n\\nThis will allow the grabber to re-evaluate and re-download it in future cycles.`)) {
+      if (!confirm(`Are you sure you want to remove this match from grabber memory?\n\n"${title}"\n\nThis will allow the grabber to re-evaluate and re-download it in future cycles.`)) {
         return;
       }
       try {
@@ -1516,7 +1231,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         if (data.ok) {
           showToast(`Match forgotten: "${title}"`, 'success');
           fetchMatches();
-          fetchLogs();
+          fetchStatus();
         } else {
           showToast('Failed to reset match: ' + (data.error || 'Unknown error'), 'error');
         }
@@ -1528,9 +1243,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     document.getElementById('btn-refresh-matches').addEventListener('click', fetchMatches);
     document.getElementById('matches-search').addEventListener('input', renderMatches);
 
-    // -------------------------------------------------------------------------
-    // Run History Management (TAB 3)
-    // -------------------------------------------------------------------------
+    // Run History Management
     async function fetchHistory() {
       const tbody = document.getElementById('history-tbody');
       try {
@@ -1585,9 +1298,52 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
     document.getElementById('btn-refresh-history').addEventListener('click', fetchHistory);
 
-    // Initial load and periodic background polling (every 2.5s)
-    fetchLogs();
-    setInterval(fetchLogs, 2500);
+    // Status Polling
+    async function fetchStatus() {
+      try {
+        const res = await fetch('/api/status');
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        const data = await res.json();
+
+        const statusText = (data.status || 'Running').toUpperCase();
+        document.getElementById('badge-status-text').textContent = statusText;
+        const badgeWrap = document.getElementById('badge-status-wrap');
+        const isCycleRunning = data.is_cycle_running || statusText.includes('ACTIVE') || statusText.includes('RUNNING CYCLE');
+        badgeWrap.classList.toggle('running', isCycleRunning);
+
+        if (isCycleRunning) {
+          runBtn.disabled = true;
+          document.getElementById('run-btn-icon').textContent = '⏳';
+          document.getElementById('run-btn-text').textContent = 'Cycle Running...';
+        } else {
+          runBtn.disabled = false;
+          document.getElementById('run-btn-icon').textContent = '▶';
+          document.getElementById('run-btn-text').textContent = 'Run Check Now';
+        }
+
+        if (data.next_run) document.getElementById('stat-next-run').textContent = data.next_run;
+        if (data.last_run) document.getElementById('stat-last-run').textContent = data.last_run;
+        if (data.active_week) document.getElementById('stat-active-week').textContent = data.active_week;
+        if (data.total_torrents !== undefined) {
+          document.getElementById('stat-total-torrents').textContent = data.total_torrents;
+          document.getElementById('tab-count-torrents').textContent = data.total_torrents;
+        }
+
+        if (previousCycleRunning && !isCycleRunning) {
+          fetchMatches();
+          fetchHistory();
+        }
+        previousCycleRunning = isCycleRunning;
+      } catch (err) {
+        // Silently keep current display on transient connection error
+      }
+    }
+
+    // Initial load and periodic status polling (every 3s)
+    fetchStatus();
+    fetchMatches();
+    fetchHistory();
+    setInterval(fetchStatus, 3000);
   </script>
 </body>
 </html>
@@ -1627,21 +1383,8 @@ class LogRequestHandler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
 
-        elif path == "/api/logs":
-            since_id = 0
-            if "since" in params:
-                try:
-                    since_id = int(params["since"][0])
-                except ValueError:
-                    since_id = 0
-
+        elif path == "/api/status":
             with _log_lock:
-                if since_id > 0:
-                    entries = [e for e in log_buffer if e["id"] > since_id]
-                else:
-                    entries = list(log_buffer)
-
-                total_lines = len(log_buffer)
                 status_copy = dict(_service_info)
                 status_copy["is_cycle_running"] = _cycle_lock.locked()
 
@@ -1655,8 +1398,26 @@ class LogRequestHandler(http.server.BaseHTTPRequestHandler):
                 "last_run": status_copy.get("last_run"),
                 "active_week": status_copy.get("active_week"),
                 "total_torrents": total_torrents,
-                "total_logs": total_lines,
-                "logs": entries,
+            }
+            self._send_json(200, payload)
+
+        elif path == "/api/logs":
+            with _log_lock:
+                status_copy = dict(_service_info)
+                status_copy["is_cycle_running"] = _cycle_lock.locked()
+
+            total_torrents = get_total_grabbed_torrents(status_copy.get("db_path"))
+
+            payload = {
+                "status": status_copy.get("status", "Running"),
+                "is_cycle_running": status_copy.get("is_cycle_running", False),
+                "started_at": status_copy.get("started_at"),
+                "next_run": status_copy.get("next_run"),
+                "last_run": status_copy.get("last_run"),
+                "active_week": status_copy.get("active_week"),
+                "total_torrents": total_torrents,
+                "total_logs": 0,
+                "logs": [],
             }
             self._send_json(200, payload)
 
@@ -1681,18 +1442,11 @@ class LogRequestHandler(http.server.BaseHTTPRequestHandler):
             self._send_json(200, {"ok": True, "count": len(runs), "runs": runs})
 
         elif path == "/logs":
-            is_download = "download" in params
-            reverse_order = "reverse" in params or "desc" in params
-            with _log_lock:
-                raw_entries = list(reversed(log_buffer)) if reverse_order else list(log_buffer)
-                text_content = "\n".join(e["raw"] for e in raw_entries) + "\n"
-
-            encoded = text_content.encode("utf-8")
+            msg = "Logs are available via standard container output ('docker logs nfl-torrent-grabber').\n"
+            encoded = msg.encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/plain; charset=utf-8")
             self.send_header("Content-Length", str(len(encoded)))
-            if is_download:
-                self.send_header("Content-Disposition", 'attachment; filename="nfl_grabber.log"')
             self.end_headers()
             self.wfile.write(encoded)
 
@@ -1724,7 +1478,7 @@ class LogRequestHandler(http.server.BaseHTTPRequestHandler):
             elif str(body_data.get("dry_run", "")).lower() in ("1", "true", "yes"):
                 dry_run = True
 
-            started, msg = trigger_cycle_async(dry_run=dry_run)
+            started, msg = trigger_cycle_async(dry_run=dry_run, favorite_only=False)
             if not started:
                 self._send_json(409, {"ok": False, "error": msg})
             else:
@@ -1768,11 +1522,11 @@ def start_web_server(
     config: Any = None,
     state: Any = None,
     notifier: Any = None,
-    cycle_runner: Optional[Callable[[bool], Any]] = None,
+    cycle_runner: Optional[Callable[..., Any]] = None,
     schedule_logger: Optional[Callable[[], Any]] = None,
 ):
     """
-    Initializes the in-memory log buffer and spins up the Web UI server in a daemon thread.
+    Spins up the lightweight Web UI server in a daemon thread.
     Registers service coordinator callbacks for manual triggers, diagnostics, and data operations.
     """
     update_service_status(db_path=db_path)
@@ -1781,16 +1535,6 @@ def start_web_server(
     _service_context["notifier"] = notifier
     _service_context["cycle_runner"] = cycle_runner
     _service_context["schedule_logger"] = schedule_logger
-
-    # Attach MemoryLogHandler to the root logger so all logs are captured in memory
-    root_logger = logging.getLogger()
-    has_mem_handler = any(isinstance(h, MemoryLogHandler) for h in root_logger.handlers)
-    if not has_mem_handler:
-        mem_handler = MemoryLogHandler(log_file=log_file)
-        mem_handler.setFormatter(
-            logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s", "%Y-%m-%d %H:%M:%S")
-        )
-        root_logger.addHandler(mem_handler)
 
     class ReusableThreadingServer(http.server.ThreadingHTTPServer):
         allow_reuse_address = True

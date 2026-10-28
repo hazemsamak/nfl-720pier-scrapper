@@ -62,6 +62,7 @@ class Config:
     # Service & Persistence
     check_interval_hours: float
     schedule_days: list[str]
+    top_matches_days: list[str]
     schedule_times: list[str]
     run_on_startup: bool
     state_file_path: str
@@ -115,7 +116,12 @@ class Config:
             check_interval_hours=float(os.getenv("CHECK_INTERVAL_HOURS", "6")),
             schedule_days=[
                 d.strip()
-                for d in os.getenv("SCHEDULE_DAYS", "Mon,Tue,Wed").split(",")
+                for d in os.getenv("SCHEDULE_DAYS", "Mon,Tue,Wed,Thu,Fri,Sat,Sun").split(",")
+                if d.strip()
+            ],
+            top_matches_days=[
+                d.strip()
+                for d in os.getenv("TOP_MATCHES_DAYS", "Mon,Tue,Wed").split(",")
                 if d.strip()
             ],
             schedule_times=parsed_times,

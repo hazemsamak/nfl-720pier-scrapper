@@ -162,17 +162,34 @@ def format_relative_time(target_dt: datetime, base_dt: Optional[datetime] = None
 
 
 def execute_grabber_cycle(
-    config: Config, state: StateManager, notifier: Notifier, dry_run: bool = False
+    config: Config,
+    state: StateManager,
+    notifier: Notifier,
+    dry_run: bool = False,
+    favorite_only: Optional[bool] = None,
 ) -> int:
     """
     Executes a single grabber pass:
     1. Tests qBittorrent connection & credentials (unless dry_run).
-    2. Scrapes latest week and top 2 torrents (plus configured favorite teams).
+    2. Scrapes latest week and torrents (top 2 + favorite team, or favorite team only).
     3. Filters out already processed items (unless dry_run).
     4. Downloads and pushes new torrents to qBittorrent (unless dry_run).
     5. Dispatches notifications / alerts via Discord and Telegram.
     Returns count of newly added torrents.
     """
+    if favorite_only is None:
+        is_top_day = is_scheduled_day(getattr(config, "top_matches_days", ["Mon", "Tue", "Wed"]))
+        favorite_only = not is_top_day
+
+    mode_tags = []
+    if dry_run:
+        mode_tags.append("DRY RUN")
+    if favorite_only:
+        mode_tags.append("FAVORITE TEAMS ONLY")
+    else:
+        mode_tags.append("TOP 2 MATCHES + FAVORITE TEAMS")
+    mode_str = f" ({', '.join(mode_tags)})" if mode_tags else ""
+
     run_id = None
     if hasattr(state, "record_run_start") and not dry_run:
         try:
@@ -182,7 +199,7 @@ def execute_grabber_cycle(
 
     try:
         logger.info("==================================================")
-        logger.info("Starting NFL THUUZ torrent check%s...", " (DRY RUN)" if dry_run else "")
+        logger.info("Starting NFL THUUZ torrent check%s...", mode_str)
         logger.info("Thread URL: %s", config.pier_thread_url)
 
         scraper = PierScraper(
@@ -285,6 +302,7 @@ def execute_grabber_cycle(
             week_elem,
             limit=2,
             favorite_teams=config.favorite_teams,
+            favorite_only=favorite_only,
         )
         if not top_torrents:
             logger.warning("No torrent links could be extracted from %s.", week_title)
@@ -447,13 +465,16 @@ def main():
             schedule_times=schedule_times,
             current_dt=base_dt,
         )
+        is_next_top = is_scheduled_day(config.top_matches_days, next_dt)
+        next_scope = "Top 2 + Favorite" if is_next_top else "Favorite Only"
         rel_str = format_relative_time(next_dt, base_dt=base_dt)
         formatted_next = f"{next_dt.strftime('%A, %Y-%m-%d %H:%M:%S')} ({rel_str})"
         update_service_status(next_run=formatted_next, status="Running")
         logger.info(
-            "Next grabber cycle scheduled for: %s (%s)",
+            "Next grabber cycle scheduled for: %s (%s) [%s]",
             next_dt.strftime("%A, %Y-%m-%d %H:%M:%S"),
             rel_str,
+            next_scope,
         )
         return next_dt
 
@@ -465,7 +486,9 @@ def main():
             config=config,
             state=state,
             notifier=notifier,
-            cycle_runner=lambda dry_run=False: execute_grabber_cycle(config, state, notifier, dry_run=dry_run),
+            cycle_runner=lambda dry_run=False, favorite_only=None: execute_grabber_cycle(
+                config, state, notifier, dry_run=dry_run, favorite_only=favorite_only
+            ),
             schedule_logger=log_next_run,
         )
 
@@ -473,8 +496,8 @@ def main():
     signal.signal(signal.SIGTERM, handle_shutdown)
 
     if args.dry_run or args.once:
-        logger.info("Running in one-shot mode%s.", " (DRY RUN)" if args.dry_run else "")
-        execute_grabber_cycle(config, state, notifier, dry_run=args.dry_run)
+        logger.info("Running in one-shot mode%s (evaluating top matches & favorite team).", " (DRY RUN)" if args.dry_run else "")
+        execute_grabber_cycle(config, state, notifier, dry_run=args.dry_run, favorite_only=False)
         sys.exit(0)
 
     def run_scheduled_cycle():
@@ -488,24 +511,30 @@ def main():
             log_next_run()
             return 0
         from src.web import run_cycle_synchronized
-        success, _ = run_cycle_synchronized(dry_run=False, caller="scheduler")
+        is_top_day = is_scheduled_day(config.top_matches_days)
+        fav_only = not is_top_day
+        cycle_type_desc = "Top 2 matches + favorite team" if is_top_day else "Favorite team only"
+        logger.info("Triggering scheduled cycle for %s (%s)...", current_day_name, cycle_type_desc)
+        success, _ = run_cycle_synchronized(dry_run=False, caller="scheduler", favorite_only=fav_only)
         log_next_run()
         return 1 if success else 0
 
     # Scheduled mode
     if schedule_times:
         logger.info(
-            "Running in scheduled service mode on [%s] at [%s]. Press Ctrl+C to terminate.",
+            "Running in scheduled service mode on [%s] at [%s] (Top matches on: [%s]). Press Ctrl+C to terminate.",
             days_label,
             times_label,
+            ", ".join(config.top_matches_days),
         )
         for t_str in schedule_times:
             schedule.every().day.at(t_str).do(run_scheduled_cycle)
     else:
         logger.info(
-            "Running in scheduled service mode on [%s] every %.2f hour(s). Press Ctrl+C to terminate.",
+            "Running in scheduled service mode on [%s] every %.2f hour(s) (Top matches on: [%s]). Press Ctrl+C to terminate.",
             days_label,
             interval_hours,
+            ", ".join(config.top_matches_days),
         )
         schedule.every(interval_hours).hours.do(run_scheduled_cycle)
 
@@ -513,9 +542,14 @@ def main():
     today_name = datetime.now().strftime("%A")
     if getattr(config, "run_on_startup", False):
         if is_scheduled_day(config.schedule_days):
-            logger.info("Today (%s) is an active scheduled run day. Running initial grabber cycle...", today_name)
+            is_top_day = is_scheduled_day(config.top_matches_days)
+            logger.info(
+                "Today (%s) is an active scheduled run day. Running initial grabber cycle (%s)...",
+                today_name,
+                "Top 2 matches + favorite team" if is_top_day else "Favorite team only",
+            )
             from src.web import run_cycle_synchronized
-            run_cycle_synchronized(dry_run=False, caller="startup")
+            run_cycle_synchronized(dry_run=False, caller="startup", favorite_only=not is_top_day)
         else:
             logger.info(
                 "Service started. Today (%s) is outside scheduled active days (%s). Standing by for next scheduled run.",

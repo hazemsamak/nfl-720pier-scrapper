@@ -197,7 +197,8 @@ class TestNFLGrabber(unittest.TestCase):
         self.assertIsNotNone(config.pier_thread_url)
         self.assertIsNotNone(config.qbit_host)
         self.assertEqual(config.qbit_save_path, "/nfl")
-        self.assertEqual(config.schedule_days, ["Mon", "Tue", "Wed"])
+        self.assertEqual(config.schedule_days, ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"])
+        self.assertEqual(config.top_matches_days, ["Mon", "Tue", "Wed"])
         self.assertEqual(config.schedule_times, ["09:00", "15:00", "21:00"])
         self.assertFalse(config.run_on_startup)
         self.assertIsInstance(config.check_interval_hours, float)
@@ -806,7 +807,7 @@ class TestNFLGrabber(unittest.TestCase):
         # Normal run
         success, msg = run_cycle_synchronized(dry_run=True, caller="test")
         self.assertTrue(success)
-        mock_runner.assert_called_once_with(dry_run=True)
+        mock_runner.assert_called_once_with(dry_run=True, favorite_only=None)
 
         # Verify collision lock
         with _cycle_lock:
@@ -888,6 +889,86 @@ class TestNFLGrabber(unittest.TestCase):
         # 2 days, 3 hours ahead
         t3 = base + timedelta(days=2, hours=3)
         self.assertEqual(format_relative_time(t3, base_dt=base), "in 2 days, 3 hours")
+
+    def test_scraper_extract_favorite_only(self):
+        sample_week_html = """
+        <div class="spoiler">
+            <strong>Week 6</strong>
+            <div class="content">
+                100 pts - <a href="download/file.php?id=6001">Baltimore Ravens vs Buffalo Bills</a><br/>
+                96 pts - <a href="download/file.php?id=6002">Philadelphia Eagles vs Dallas Cowboys</a><br/>
+                92 pts - <a href="download/file.php?id=6003">Detroit Lions vs Green Bay Packers</a><br/>
+                88 pts - <a href="download/file.php?id=6004">Kansas City Chiefs vs Denver Broncos</a><br/>
+            </div>
+        </div>
+        """
+        scraper = PierScraper(thread_url="https://720pier.ru/viewtopic.php?t=76272")
+        soup = BeautifulSoup(sample_week_html, "lxml")
+
+        # When favorite_only is True, top matches should be ignored and only Chiefs should be extracted
+        fav_links = scraper.extract_top_torrent_links(
+            soup,
+            limit=2,
+            favorite_teams=["Kansas City Chiefs", "KC", "Chiefs"],
+            favorite_only=True,
+        )
+        self.assertEqual(len(fav_links), 1)
+        self.assertIn("6004", fav_links[0]["torrent_url"])
+        self.assertEqual(fav_links[0]["rating"], "88")
+        self.assertTrue(fav_links[0]["is_favorite_team"])
+
+        # When favorite_only is False, top 2 matches (6001, 6002) + favorite team (6004) should be extracted
+        all_links = scraper.extract_top_torrent_links(
+            soup,
+            limit=2,
+            favorite_teams=["Kansas City Chiefs", "KC", "Chiefs"],
+            favorite_only=False,
+        )
+        self.assertEqual(len(all_links), 3)
+
+    def test_web_ui_template_and_status_api(self):
+        from src.web import HTML_TEMPLATE, LogRequestHandler
+        import io
+
+        # 1. Verify HTML template has no Live Logs tab or log stream
+        self.assertNotIn("data-tab=\"tab-logs\"", HTML_TEMPLATE)
+        self.assertNotIn("id=\"log-stream\"", HTML_TEMPLATE)
+        self.assertNotIn("id=\"tab-logs\"", HTML_TEMPLATE)
+
+        # 2. Verify Grabbed Matches is active and default view
+        self.assertIn("data-tab=\"tab-matches\"", HTML_TEMPLATE)
+        self.assertIn("data-tab=\"tab-history\"", HTML_TEMPLATE)
+        self.assertIn("tab-pane active\" id=\"tab-matches\"", HTML_TEMPLATE)
+
+        # 3. Test HTTP handler status endpoint
+        class DummyRequest:
+            def makefile(self, *args, **kwargs):
+                return io.BytesIO(b"")
+
+        handler = LogRequestHandler.__new__(LogRequestHandler)
+        handler.rfile = io.BytesIO()
+        handler.wfile = io.BytesIO()
+        handler.headers = {}
+        handler.command = "GET"
+        handler.requestline = "GET /api/status HTTP/1.1"
+        handler.request_version = "HTTP/1.1"
+
+        # Test /api/status
+        handler.path = "/api/status"
+        handler.do_GET()
+        output = handler.wfile.getvalue().decode("utf-8")
+        self.assertIn("200 OK", output)
+        self.assertIn('"status":', output)
+        self.assertIn('"total_torrents":', output)
+
+        # Test /logs informational message
+        handler.wfile = io.BytesIO()
+        handler.path = "/logs"
+        handler.requestline = "GET /logs HTTP/1.1"
+        handler.do_GET()
+        logs_output = handler.wfile.getvalue().decode("utf-8")
+        self.assertIn("200 OK", logs_output)
+        self.assertIn("docker logs", logs_output)
 
 
 if __name__ == "__main__":

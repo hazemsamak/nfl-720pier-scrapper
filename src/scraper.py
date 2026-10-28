@@ -220,21 +220,28 @@ class PierScraper:
         week_soup: BeautifulSoup,
         limit: int = 2,
         favorite_teams: Optional[List[str]] = None,
+        favorite_only: bool = False,
     ) -> List[Dict[str, str]]:
         """
         Extracts up to `limit` (default: 2) torrent download links from the latest week section,
         plus any match involving `favorite_teams` (e.g. Kansas City Chiefs / KC) even if outside the top limit.
+        If `favorite_only` is True, only matches involving `favorite_teams` are extracted.
         """
         top_candidates: List[Dict[str, str]] = []
         favorite_candidates: List[Dict[str, str]] = []
         seen_targets = set()
+        effective_limit = 0 if favorite_only else limit
 
         # Extract THUUZ thread ID to avoid self-referencing
         thuuz_topic_id = self._extract_topic_id(self.thread_url)
 
         # Find all anchor tags
         links = week_soup.find_all("a", href=True)
-        logger.info("Found %d total links inside the latest week section.", len(links))
+        logger.info(
+            "Found %d total links inside the latest week section%s.",
+            len(links),
+            " (filtering favorite teams only)" if favorite_only else "",
+        )
 
         for link in links:
             href = link["href"].strip()
@@ -249,7 +256,7 @@ class PierScraper:
                 continue
 
             is_fav = self.matches_favorite_team(link_text, favorite_teams)
-            is_top = len(top_candidates) < limit
+            is_top = (len(top_candidates) < effective_limit) if not favorite_only else False
 
             # If top quota is met and this is not a favorite team candidate, skip
             if not is_top and not is_fav:
@@ -305,19 +312,25 @@ class PierScraper:
                     torrent_info["selection_reason"] = "favorite"
                     favorite_candidates.append(torrent_info)
                     logger.info(
-                        "Selected favorite team match outside top %d: [%s pts] %s",
-                        limit,
+                        "Selected favorite team match%s: [%s pts] %s",
+                        "" if favorite_only else f" outside top {limit}",
                         rating,
                         resolved_title,
                     )
 
         combined = top_candidates + favorite_candidates
-        logger.info(
-            "Extracted %d torrent link(s) for the latest week (%d top-rated, %d additional favorite team match(es)).",
-            len(combined),
-            len(top_candidates),
-            len(favorite_candidates),
-        )
+        if favorite_only:
+            logger.info(
+                "Extracted %d favorite team torrent link(s) for the latest week.",
+                len(combined),
+            )
+        else:
+            logger.info(
+                "Extracted %d torrent link(s) for the latest week (%d top-rated, %d additional favorite team match(es)).",
+                len(combined),
+                len(top_candidates),
+                len(favorite_candidates),
+            )
         return combined
 
     def _is_direct_torrent_link(self, url: str) -> bool:
