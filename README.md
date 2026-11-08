@@ -1,18 +1,24 @@
 # NFL 720pier THUUZ Torrent Grabber & qBittorrent Forwarder
 
-An automated, containerized Python service that monitors the NFL THUUZ Game Rating thread on **720pier.ru**, extracts the top 2 highest-rated games of the latest week, downloads the `.torrent` files using authenticated sessions, and immediately pushes them to an existing **qBittorrent** instance.
+An automated, containerized Python service that monitors the NFL THUUZ Game Rating thread on **720pier.ru**, extracts the top rated games of the latest week (configurable, defaulting to the top 1 match plus your favorite team), downloads the `.torrent` files using authenticated sessions, and immediately pushes them to an existing **qBittorrent** instance.
 
 ---
 
 ## Features
 
-- **Automated Latest Week Detection**: Scans the THUUZ forum topic, automatically identifies the highest week number (e.g., Week 5, Week 6), and parses games ordered from 100 to 0.
-- **Top 2 Torrents Selection**: Automatically selects and downloads the first 2 torrent files listed in the latest week.
+- **Automated Latest Week Detection**: Scans the THUUZ forum topic, automatically identifies the highest week number (e.g., Week 5, Week 6, Week 8), and parses games ordered from 100 to 0.
+- **Top Match & Favorite Team Selection**: Automatically selects and downloads the top rated torrent(s) (configured via `TOP_MATCHES_LIMIT`, default 1) plus any match involving your favorite team(s).
 - **Topic & Direct Link Resolution**: Seamlessly handles direct `.torrent` attachment links as well as following game topic pages (`viewtopic.php?t=...`) to locate the release torrent file.
 - **Flexible 720pier Authentication**: Supports standard username/password login as well as browser session cookie strings (`PIER_COOKIE`) to easily bypass Cloudflare or CAPTCHA challenges.
 - **qBittorrent Web API Integration**: Directly uploads `.torrent` binary files, starts downloads immediately, and tags them with category `NFL` and tags `720pier,thuuz`.
 - **Deduplication & State Persistence**: Preserves processed torrents in `data/state.json` via Docker volume so games are never re-added across restarts.
-- **Optional Webhook Notifications**: Dispatches alerts to Discord and/or Telegram when new matches are added to qBittorrent.
+- **Interactive Web Dashboard**:
+  - **Active Week Match Browser**: View all matches from the current week sorted by THUUZ rating, inspect status (Grabbed, Favorite, Available), and manually trigger a 1-click download directly to qBittorrent.
+  - **Live Settings Management**: Configure grabber preferences, teams, schedules, and credentials directly in the Web UI. Writes changes back to `.env` and hot-reloads running schedulers immediately without container restarts.
+  - **Dashboard Authentication**: Optional HTTP Basic Auth via `WEB_USERNAME` and `WEB_PASSWORD` in `.env`.
+  - **History & Grabbed Torrents**: Live overview of all processed torrents and execution run results.
+  - **On-Demand Runs & Diagnostics**: Trigger standard or dry-run checks instantly, test qBittorrent connectivity, and refresh match data.
+- **Optional Webhook Notifications**: Dispatches alerts to Discord and/or Telegram when new matches are added to qBittorrent (tagged with manual vs automatic source).
 - **Daemon & One-Shot Modes**: Runs continuously in Docker on a scheduled interval (e.g. every 6 hours), or on-demand using `--once`.
 
 ---
@@ -25,18 +31,20 @@ An automated, containerized Python service that monitors the NFL THUUZ Game Rati
 ├── src/                  # Core application package
 │   ├── __init__.py       # Package exports
 │   ├── config.py         # Configuration loader & dataclass (.env)
+│   ├── database.py       # SQLite database manager (data/nfl_grabber.db)
 │   ├── main.py           # Execution loop, scheduling, & cycle logic
 │   ├── notifier.py       # Discord & Telegram notifications
 │   ├── qbittorrent.py    # qBittorrent Web API client (API key / Bearer auth)
 │   ├── scraper.py        # 720pier forum scraper & torrent downloader
-│   └── state.py          # State persistence manager (data/state.json)
+│   ├── state.py          # State persistence adapter & backward compatibility
+│   └── web.py            # Responsive web dashboard UI & REST API server
 ├── scripts/              # Standalone utility & testing scripts
 │   └── test_scrape.py    # Interactive forum scraping tester
 ├── tests/                # Automated unit test suite
 │   ├── __init__.py
 │   └── test_grabber.py
-├── data/                 # Volume mount directory for persistent state
-│   └── state.json
+├── data/                 # Volume mount directory for persistent database
+│   └── nfl_grabber.db
 ├── Dockerfile            # Container build specification
 ├── docker-compose.yml    # Docker Compose deployment setup
 ├── requirements.txt      # Python dependencies
@@ -67,8 +75,11 @@ PIER_PASSWORD=your_forum_password
 # copy your browser's Cookie header string (e.g. phpbb3_... session cookie):
 PIER_COOKIE=
 
-# Favorite team(s) to always download even if outside the top 2 matches:
+# Favorite team(s) to always download even if outside the top matches:
 FAVORITE_TEAMS=Kansas City Chiefs, KC, Chiefs
+
+# Number of top rated matches to grab per week (default: 1)
+TOP_MATCHES_LIMIT=1
 
 # qBittorrent Connection (API Key recommended for v5.2.0+)
 QBIT_HOST=http://host.docker.internal:8080
@@ -85,6 +96,13 @@ SCHEDULE_DAYS=Mon,Tue,Wed
 SCHEDULE_TIMES=09:00,15:00,21:00
 RUN_ON_STARTUP=false
 RENAME_TORRENT_FILES=true
+
+# Web Dashboard (http://localhost:5020)
+WEB_PORT=5020
+WEB_ENABLED=true
+# Optional HTTP Basic Auth (leave empty to disable login prompt)
+WEB_USERNAME=
+WEB_PASSWORD=
 ```
 
 ### 2. Networking with Existing qBittorrent Container

@@ -218,12 +218,12 @@ class PierScraper:
     def extract_top_torrent_links(
         self,
         week_soup: BeautifulSoup,
-        limit: int = 2,
+        limit: int = 1,
         favorite_teams: Optional[List[str]] = None,
         favorite_only: bool = False,
     ) -> List[Dict[str, str]]:
         """
-        Extracts up to `limit` (default: 2) torrent download links from the latest week section,
+        Extracts up to `limit` (default: 1) torrent download links from the latest week section,
         plus any match involving `favorite_teams` (e.g. Kansas City Chiefs / KC) even if outside the top limit.
         If `favorite_only` is True, only matches involving `favorite_teams` are extracted.
         """
@@ -311,9 +311,10 @@ class PierScraper:
                 elif is_fav:
                     torrent_info["selection_reason"] = "favorite"
                     favorite_candidates.append(torrent_info)
+                    limit_desc = f"top {limit}" if limit > 1 else "top 1"
                     logger.info(
                         "Selected favorite team match%s: [%s pts] %s",
-                        "" if favorite_only else f" outside top {limit}",
+                        "" if favorite_only else f" outside {limit_desc}",
                         rating,
                         resolved_title,
                     )

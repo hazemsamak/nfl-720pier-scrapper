@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import re
 import shutil
 import sqlite3
 from datetime import datetime, timezone
@@ -146,6 +147,35 @@ class DatabaseManager:
             (torrent_id,),
         )
         return cur.fetchone() is not None
+
+    def is_match_or_url_processed(self, url: str, matchup: str = "", week: Optional[str] = None) -> bool:
+        """
+        Checks if a match is already recorded either by exact URL or by matchup team names.
+        """
+        if url and self.is_torrent_processed(url):
+            return True
+
+        if not matchup:
+            return False
+
+        clean_match = re.sub(r"\[.*?\]|\(.*?\)", "", matchup).strip()
+        teams = [t.strip() for t in re.split(r"\s+(?:at|vs|@)\s+", clean_match, flags=re.I) if t.strip()]
+        if len(teams) < 2:
+            return False
+
+        query = "SELECT title FROM processed_torrents"
+        params = []
+        if week:
+            query += " WHERE week = ? OR week LIKE ?"
+            params.extend([week, f"%{week}%"])
+
+        cur = self._conn.execute(query, tuple(params))
+        rows = cur.fetchall()
+        for r in rows:
+            title = r[0] or ""
+            if all(t.lower() in title.lower() for t in teams):
+                return True
+        return False
 
     def record_processed_torrent(
         self,

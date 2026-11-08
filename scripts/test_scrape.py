@@ -60,8 +60,13 @@ def main():
         print(f"  {idx:2d}. [{m.get('rating'):>3} pts] {m.get('title')} ({m.get('url')})")
 
     # Extract all links and top torrent candidates
-    print(f"\n--- Selected Top 2 Match Candidates for Download ---")
-    top_torrents = scraper.extract_top_torrent_links(week_elem, limit=2)
+    top_limit = getattr(config, "top_matches_limit", 1)
+    print(f"\n--- Selected Top {top_limit} Match Candidates for Download ---")
+    top_torrents = scraper.extract_top_torrent_links(
+        week_elem,
+        limit=top_limit,
+        favorite_teams=config.favorite_teams,
+    )
     if not top_torrents:
         print("⚠️ No torrent links found in the latest week section.")
     else:

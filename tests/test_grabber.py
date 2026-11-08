@@ -14,6 +14,10 @@ from src.state import StateManager
 
 class TestNFLGrabber(unittest.TestCase):
 
+    def tearDown(self):
+        from src.web import _service_context
+        _service_context.clear()
+
     def test_state_manager(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             state_path = os.path.join(tmpdir, "state.json")
@@ -179,6 +183,46 @@ class TestNFLGrabber(unittest.TestCase):
         self.assertEqual(results[2]["selection_reason"], "favorite")
         self.assertTrue(results[2]["is_favorite_team"])
 
+    def test_extract_top_torrent_links_limit_1_plus_favorite(self):
+        sample_week_html = """
+        <div class="spoiler">
+            <summary>Week 08</summary>
+            <div class="content">
+                100 pts - <a href="download/file.php?id=4001">Tennessee Titans at Cincinnati Bengals</a><br/>
+                91 pts - <a href="download/file.php?id=4002">Arizona Cardinals at Dallas Cowboys</a><br/>
+                78 pts - <a href="download/file.php?id=4005">Kansas City Chiefs at Denver Broncos</a><br/>
+            </div>
+        </div>
+        """
+        scraper = PierScraper(thread_url="https://720pier.ru/viewtopic.php?t=76272")
+        soup = BeautifulSoup(sample_week_html, "lxml")
+
+        # When limit is 1, only top 1 (4001) PLUS favorite team (4005) should be extracted (2 total), skipping 4002
+        results = scraper.extract_top_torrent_links(
+            soup,
+            limit=1,
+            favorite_teams=["Kansas City Chiefs", "KC", "Chiefs"],
+        )
+        self.assertEqual(len(results), 2)
+        self.assertIn("4001", results[0]["torrent_url"])
+        self.assertEqual(results[0]["selection_reason"], "top")
+        self.assertEqual(results[0]["rating"], "100")
+        self.assertFalse(results[0]["is_favorite_team"])
+
+        self.assertIn("4005", results[1]["torrent_url"])
+        self.assertEqual(results[1]["selection_reason"], "favorite")
+        self.assertEqual(results[1]["rating"], "78")
+        self.assertTrue(results[1]["is_favorite_team"])
+
+        # Also test default limit is 1
+        default_results = scraper.extract_top_torrent_links(
+            soup,
+            favorite_teams=["Kansas City Chiefs", "KC", "Chiefs"],
+        )
+        self.assertEqual(len(default_results), 2)
+        self.assertEqual(default_results[0]["torrent_url"], results[0]["torrent_url"])
+        self.assertEqual(default_results[1]["torrent_url"], results[1]["torrent_url"])
+
     def test_notifier_formatting(self):
         notifier = Notifier(discord_webhook_url="https://discord.com/api/webhooks/mock")
         with patch("requests.post") as mock_post:
@@ -199,6 +243,7 @@ class TestNFLGrabber(unittest.TestCase):
         self.assertEqual(config.qbit_save_path, "/nfl")
         self.assertEqual(config.schedule_days, ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"])
         self.assertEqual(config.top_matches_days, ["Mon", "Tue", "Wed"])
+        self.assertEqual(config.top_matches_limit, 1)
         self.assertEqual(config.schedule_times, ["09:00", "15:00", "21:00"])
         self.assertFalse(config.run_on_startup)
         self.assertIsInstance(config.check_interval_hours, float)
@@ -969,6 +1014,265 @@ class TestNFLGrabber(unittest.TestCase):
         logs_output = handler.wfile.getvalue().decode("utf-8")
         self.assertIn("200 OK", logs_output)
         self.assertIn("docker logs", logs_output)
+
+        # 4. Verify new tabs exist in HTML_TEMPLATE
+        self.assertIn("data-tab=\"tab-browser\"", HTML_TEMPLATE)
+        self.assertIn("data-tab=\"tab-settings\"", HTML_TEMPLATE)
+        self.assertIn("id=\"tab-browser\"", HTML_TEMPLATE)
+        self.assertIn("id=\"tab-settings\"", HTML_TEMPLATE)
+
+    def test_database_is_match_or_url_processed(self):
+        from src.database import DatabaseManager
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test_match_search.db")
+            db = DatabaseManager(db_path=db_path)
+
+            # Record a match with full release title
+            db.record_processed_torrent(
+                torrent_id="https://720pier.ru/download/torrent?id=12345",
+                title="NFL 2026-2027 / Week 08 / 01.11.2026 / Tennessee Titans @ Cincinnati Bengals [Football, WEB-DL HD/1080p/60fps, MKV/H.264, EN/CBS]",
+                week="Week 8",
+                rating="100",
+            )
+
+            # 1. Match by exact torrent URL
+            self.assertTrue(db.is_match_or_url_processed("https://720pier.ru/download/torrent?id=12345"))
+
+            # 2. Match by matchup team names with topic URL
+            self.assertTrue(db.is_match_or_url_processed(
+                url="https://720pier.ru/viewtopic.php?t=99999",
+                matchup="Tennessee Titans at Cincinnati Bengals",
+                week="Week 8",
+            ))
+
+            # 3. Match with 'vs' instead of 'at'
+            self.assertTrue(db.is_match_or_url_processed(
+                url="https://720pier.ru/viewtopic.php?t=88888",
+                matchup="Tennessee Titans vs Cincinnati Bengals",
+                week="Week 8",
+            ))
+
+            # 4. Non-matching teams
+            self.assertFalse(db.is_match_or_url_processed(
+                url="https://720pier.ru/viewtopic.php?t=77777",
+                matchup="Green Bay Packers at Chicago Bears",
+                week="Week 8",
+            ))
+
+    def test_config_update_env_and_masked_settings(self):
+        from src.config import Config, update_env_file, get_masked_settings
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env_file = os.path.join(tmpdir, ".env")
+            initial_content = """# Comment line
+PIER_USERNAME=original_user
+PIER_PASSWORD=secret_password_123
+TOP_MATCHES_LIMIT=1
+FAVORITE_TEAMS=Chiefs
+"""
+            with open(env_file, "w", encoding="utf-8") as f:
+                f.write(initial_content)
+
+            # Test 1: Update with masked password should NOT overwrite the secret
+            updates = {
+                "PIER_USERNAME": "new_user",
+                "PIER_PASSWORD": "********",  # Masked!
+                "TOP_MATCHES_LIMIT": "2",
+                "SCHEDULE_TIMES": "10:00,16:00",
+            }
+            success = update_env_file(updates, env_path=env_file)
+            self.assertTrue(success)
+
+            with open(env_file, "r", encoding="utf-8") as f:
+                updated_content = f.read()
+
+            self.assertIn("PIER_USERNAME=new_user", updated_content)
+            self.assertIn("PIER_PASSWORD=secret_password_123", updated_content)  # Kept!
+            self.assertIn("TOP_MATCHES_LIMIT=2", updated_content)
+            self.assertIn("SCHEDULE_TIMES=10:00,16:00", updated_content)
+
+            # Test 2: Masked settings serialization
+            cfg = Config.load(env_path=env_file)
+            masked = get_masked_settings(cfg)
+            self.assertEqual(masked["pier_username"], "new_user")
+            self.assertEqual(masked["pier_password"], "********")
+            self.assertTrue(masked["has_pier_password"])
+            self.assertEqual(masked["top_matches_limit"], 2)
+
+    def test_web_basic_auth(self):
+        from src.web import LogRequestHandler, _service_context
+        import io
+        import base64
+
+        handler = LogRequestHandler.__new__(LogRequestHandler)
+        handler.requestline = "GET / HTTP/1.1"
+        handler.request_version = "HTTP/1.1"
+        handler.command = "GET"
+        handler.rfile = io.BytesIO()
+        handler.wfile = io.BytesIO()
+        handler.headers = {}
+
+        # 1. No credentials configured -> check_auth() is True
+        mock_cfg = MagicMock()
+        mock_cfg.web_username = None
+        mock_cfg.web_password = None
+        _service_context["config"] = mock_cfg
+        self.assertTrue(handler.check_auth())
+
+        # 2. Credentials configured but no header -> check_auth() is False and sends 401
+        mock_cfg.web_username = "admin"
+        mock_cfg.web_password = "supersecretpassword"
+        handler.wfile = io.BytesIO()
+        handler.headers = {}
+        self.assertFalse(handler.check_auth())
+        output = handler.wfile.getvalue().decode("utf-8")
+        self.assertIn("401 Unauthorized", output)
+        self.assertIn("WWW-Authenticate: Basic", output)
+
+        # 3. Invalid credentials -> check_auth() is False and sends 401
+        bad_auth = base64.b64encode(b"admin:wrongpassword").decode("utf-8")
+        handler.wfile = io.BytesIO()
+        handler.headers = {"Authorization": f"Basic {bad_auth}"}
+        self.assertFalse(handler.check_auth())
+
+        # 4. Valid credentials -> check_auth() is True
+        good_auth = base64.b64encode(b"admin:supersecretpassword").decode("utf-8")
+        handler.wfile = io.BytesIO()
+        handler.headers = {"Authorization": f"Basic {good_auth}"}
+        self.assertTrue(handler.check_auth())
+
+    def test_web_matches_and_settings_endpoints(self):
+        from src.web import LogRequestHandler, _service_context, update_cached_matches
+        from src.config import Config
+        import io
+        import json
+
+        cfg = Config(
+            pier_thread_url="https://720pier.ru/viewtopic.php?t=76272",
+            pier_username=None,
+            pier_password=None,
+            pier_cookie=None,
+            quality_preference="720p",
+            favorite_teams=["KC"],
+            qbit_host="http://localhost:8080",
+            qbit_api_key=None,
+            qbit_username="admin",
+            qbit_password="password",
+            qbit_category="NFL",
+            qbit_tags="720pier",
+            qbit_save_path="/nfl",
+            qbit_auto_start=True,
+            rename_torrent_files=True,
+            check_interval_hours=6,
+            schedule_days=["mon"],
+            top_matches_days=["tue"],
+            top_matches_limit=1,
+            schedule_times=["08:00"],
+            run_on_startup=True,
+            state_file_path="data/state.json",
+            db_path="data/nfl_grabber.db",
+            discord_webhook_url=None,
+            telegram_bot_token=None,
+            telegram_chat_id=None,
+            proxy_url=None,
+            web_port=5020,
+            web_enabled=True,
+            web_username=None,
+            web_password=None,
+        )
+        _service_context["config"] = cfg
+
+        update_cached_matches("Week 8", [
+            {"title": "Titans at Bengals", "rating": "100", "url": "https://720pier.ru/1", "is_grabbed": False, "is_favorite": False},
+            {"title": "Chiefs at Broncos", "rating": "78", "url": "https://720pier.ru/2", "is_grabbed": True, "is_favorite": True},
+        ])
+
+        handler = LogRequestHandler.__new__(LogRequestHandler)
+        handler.requestline = "GET /api/matches HTTP/1.1"
+        handler.request_version = "HTTP/1.1"
+        handler.command = "GET"
+        handler.rfile = io.BytesIO()
+        handler.wfile = io.BytesIO()
+        handler.headers = {}
+
+        # 1. Test GET /api/matches
+        handler.path = "/api/matches"
+        handler.do_GET()
+        res_text = handler.wfile.getvalue().decode("utf-8")
+        self.assertIn("200 OK", res_text)
+        self.assertIn("Titans at Bengals", res_text)
+        self.assertIn('"count": 2', res_text)
+
+        # 2. Test GET /api/settings
+        handler.wfile = io.BytesIO()
+        handler.requestline = "GET /api/settings HTTP/1.1"
+        handler.path = "/api/settings"
+        handler.do_GET()
+        settings_text = handler.wfile.getvalue().decode("utf-8")
+        self.assertIn("200 OK", settings_text)
+        self.assertIn('"settings":', settings_text)
+
+        # 3. Test POST /api/matches/download validation
+        handler.wfile = io.BytesIO()
+        handler.rfile = io.BytesIO(b"{}")
+        handler.headers = {"Content-Length": "2"}
+        handler.requestline = "POST /api/matches/download HTTP/1.1"
+        handler.path = "/api/matches/download"
+        handler.do_POST()
+        dl_res = handler.wfile.getvalue().decode("utf-8")
+        self.assertIn("400 Bad Request", dl_res)
+
+        # 4. Test POST /api/settings validation (empty)
+        handler.wfile = io.BytesIO()
+        handler.rfile = io.BytesIO(b"{}")
+        handler.headers = {"Content-Length": "2"}
+        handler.requestline = "POST /api/settings HTTP/1.1"
+        handler.path = "/api/settings"
+        handler.do_POST()
+        cfg_res = handler.wfile.getvalue().decode("utf-8")
+        self.assertIn("400 Bad Request", cfg_res)
+
+    def test_web_manual_match_download(self):
+        from src.web import download_single_match, _service_context
+
+        mock_cfg = MagicMock()
+        mock_cfg.pier_thread_url = "https://720pier.ru/viewtopic.php?t=76272"
+        mock_cfg.rename_torrent_files = True
+        mock_cfg.favorite_teams = ["Chiefs"]
+        mock_cfg.qbit_save_path = "/nfl"
+
+        mock_state = MagicMock()
+        mock_notifier = MagicMock()
+
+        _service_context["config"] = mock_cfg
+        _service_context["state"] = mock_state
+        _service_context["notifier"] = mock_notifier
+
+        with patch("src.scraper.PierScraper.download_torrent") as mock_dl, \
+             patch("src.scraper.PierScraper._extract_torrent_from_game_topic") as mock_extract, \
+             patch("src.qbittorrent.QBittorrentClient.add_torrent_file") as mock_add:
+
+            mock_extract.return_value = {
+                "title": "Tennessee Titans at Cincinnati Bengals",
+                "torrent_url": "https://720pier.ru/download/file.php?id=9999",
+            }
+            mock_dl.return_value = (b"fake_torrent_bytes", "titans.torrent")
+            mock_add.return_value = True
+
+            success, msg = download_single_match(
+                url="https://720pier.ru/viewtopic.php?t=55555",
+                title="Tennessee Titans at Cincinnati Bengals",
+                rating="100",
+                week="Week 8",
+            )
+
+            self.assertTrue(success)
+            self.assertIn("Successfully pushed", msg)
+            mock_dl.assert_called_once()
+            mock_add.assert_called_once()
+            mock_state.record_processed_torrent.assert_called_once()
+            mock_notifier.notify_torrents_added.assert_called_once()
 
 
 if __name__ == "__main__":

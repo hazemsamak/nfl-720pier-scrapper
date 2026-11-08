@@ -43,7 +43,24 @@ _service_context: Dict[str, Any] = {
     "notifier": None,
     "cycle_runner": None,
     "schedule_logger": None,
+    "schedule_reloader": None,
 }
+
+# Cached active week matches
+_cached_matches_lock = threading.Lock()
+_cached_week_data: Dict[str, Any] = {
+    "week": None,
+    "fetched_at": None,
+    "matches": [],
+}
+
+
+def update_cached_matches(week: str, matches: List[Dict[str, Any]]):
+    """Thread-safe update of cached active week matches."""
+    with _cached_matches_lock:
+        _cached_week_data["week"] = week
+        _cached_week_data["fetched_at"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        _cached_week_data["matches"] = matches
 
 
 def update_service_status(**kwargs):
@@ -283,6 +300,192 @@ def get_runs_data(limit: int = 50) -> List[Dict[str, Any]]:
         return rows
     except Exception:
         return []
+
+
+def fetch_active_week_matches(force_refresh: bool = False) -> Dict[str, Any]:
+    """
+    Fetches matches for the active week.
+    Returns cached list if available unless force_refresh is True.
+    Updates each match's is_grabbed status against the database.
+    """
+    state = _service_context.get("state")
+    with _cached_matches_lock:
+        if not force_refresh and _cached_week_data.get("matches"):
+            week = _cached_week_data.get("week")
+            for m in _cached_week_data["matches"]:
+                if state:
+                    if hasattr(state, "is_match_or_url_processed"):
+                        m["is_grabbed"] = state.is_match_or_url_processed(m.get("url", ""), m.get("title", ""), week=week)
+                    else:
+                        m["is_grabbed"] = state.is_torrent_processed(m.get("url", ""))
+            return {
+                "ok": True,
+                "week": _cached_week_data.get("week", "Active Week"),
+                "fetched_at": _cached_week_data.get("fetched_at"),
+                "count": len(_cached_week_data["matches"]),
+                "matches": list(_cached_week_data["matches"]),
+                "source": "cache",
+            }
+
+    cfg = _service_context.get("config")
+    if not cfg:
+        return {"ok": False, "error": "Configuration not loaded", "matches": []}
+
+    try:
+        from bs4 import BeautifulSoup
+        from src.scraper import PierScraper
+
+        scraper = PierScraper(
+            thread_url=cfg.pier_thread_url,
+            username=cfg.pier_username,
+            password=cfg.pier_password,
+            cookie_string=cfg.pier_cookie,
+            quality_preference=cfg.quality_preference,
+            proxy_url=cfg.proxy_url,
+        )
+        html_doc = scraper.fetch_thread_html()
+        soup = BeautifulSoup(html_doc, "lxml")
+        week_title, week_elem = scraper.find_latest_week_section(soup)
+        raw_matches = scraper.get_all_matches_in_week(week_elem)
+
+        processed = []
+        for m in raw_matches:
+            title = m.get("title", "")
+            url = m.get("url", "")
+            rating = m.get("rating", "N/A")
+            is_g = False
+            if state:
+                if hasattr(state, "is_match_or_url_processed"):
+                    is_g = state.is_match_or_url_processed(url, title, week=week_title)
+                else:
+                    is_g = state.is_torrent_processed(url)
+            is_fav = scraper.matches_favorite_team(title, cfg.favorite_teams)
+            processed.append({
+                "title": title,
+                "rating": rating,
+                "url": url,
+                "is_grabbed": is_g,
+                "is_favorite": is_fav,
+            })
+
+        update_cached_matches(week_title, processed)
+        update_service_status(active_week=week_title)
+
+        with _cached_matches_lock:
+            return {
+                "ok": True,
+                "week": week_title,
+                "fetched_at": _cached_week_data["fetched_at"],
+                "count": len(processed),
+                "matches": list(processed),
+                "source": "live",
+            }
+    except Exception as e:
+        logger.error("Failed to fetch active week matches from 720pier: %s", e)
+        return {"ok": False, "error": str(e), "matches": []}
+
+
+def download_single_match(url: str, title: str, rating: Optional[str] = None, week: Optional[str] = None) -> tuple[bool, str]:
+    """
+    Downloads and forwards a single game release to qBittorrent, records it in SQLite,
+    and dispatches a manual grab alert notification.
+    """
+    cfg = _service_context.get("config")
+    state = _service_context.get("state")
+    notifier = _service_context.get("notifier")
+
+    if not cfg:
+        return False, "Configuration not initialized"
+
+    try:
+        from src.scraper import PierScraper
+        from src.qbittorrent import QBittorrentClient
+        from src.main import format_match_name
+
+        scraper = PierScraper(
+            thread_url=cfg.pier_thread_url,
+            username=cfg.pier_username,
+            password=cfg.pier_password,
+            cookie_string=cfg.pier_cookie,
+            quality_preference=cfg.quality_preference,
+            proxy_url=cfg.proxy_url,
+        )
+
+        qbit = QBittorrentClient(
+            host=cfg.qbit_host,
+            api_key=cfg.qbit_api_key,
+            username=cfg.qbit_username,
+            password=cfg.qbit_password,
+            category=cfg.qbit_category,
+            tags=cfg.qbit_tags,
+            save_path=cfg.qbit_save_path,
+            auto_start=cfg.qbit_auto_start,
+        )
+
+        # 1. Resolve game topic page if link is a forum thread
+        torrent_url = url
+        topic_url = url
+        resolved_title = title
+
+        if "viewtopic.php" in url:
+            info = scraper._extract_torrent_from_game_topic(url, title)
+            if info and info.get("torrent_url"):
+                torrent_url = info["torrent_url"]
+                resolved_title = info.get("title", title)
+            else:
+                return False, f"Could not find torrent download link on release page: {url}"
+
+        # 2. Download torrent binary
+        fn = f"{resolved_title}.torrent"
+        torrent_bytes, filename = scraper.download_torrent(torrent_url, fn, referer=topic_url)
+
+        # 3. Format name
+        torrent_meta = {"title": resolved_title, "matchup": title}
+        effective_week = week or _service_info.get("active_week") or "NFL"
+        custom_name = format_match_name(effective_week, torrent_meta) if cfg.rename_torrent_files else None
+
+        # 4. Push to qBittorrent
+        success = qbit.add_torrent_file(torrent_bytes, filename, custom_name=custom_name)
+        if not success:
+            return False, f"qBittorrent rejected torrent '{filename}'"
+
+        # 5. Record in database
+        if state:
+            state.record_processed_torrent(
+                torrent_url,
+                resolved_title,
+                effective_week,
+                rating=str(rating) if rating and rating != "N/A" else None,
+            )
+
+        # 6. Update cache
+        with _cached_matches_lock:
+            for m in _cached_week_data.get("matches", []):
+                if m.get("url") == url or m.get("title") == title:
+                    m["is_grabbed"] = True
+
+        # 7. Send notification alert
+        if notifier:
+            try:
+                is_fav = scraper.matches_favorite_team(resolved_title, cfg.favorite_teams)
+                item = {
+                    "title": resolved_title,
+                    "rating": rating or "N/A",
+                    "torrent_url": torrent_url,
+                    "is_favorite_team": is_fav,
+                }
+                notifier.notify_torrents_added(
+                    effective_week,
+                    [item],
+                    next_run_str="Manually grabbed via Web UI",
+                )
+            except Exception as n_err:
+                logger.warning("Error dispatching manual grab notification: %s", n_err)
+
+        return True, f"Successfully pushed '{custom_name or resolved_title}' to qBittorrent!"
+    except Exception as e:
+        logger.exception("Error during manual match download for '%s': %s", title, e)
+        return False, str(e)
 
 
 class MemoryLogHandler(logging.Handler):
@@ -807,11 +1010,120 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     }
     .tag-high { background: rgba(80, 250, 123, 0.2); color: var(--green); border: 1px solid rgba(80, 250, 123, 0.4); }
     .tag-med { background: rgba(255, 184, 108, 0.2); color: var(--orange); border: 1px solid rgba(255, 184, 108, 0.4); }
+    .tag-low { background: rgba(98, 114, 164, 0.2); color: var(--muted); border: 1px solid rgba(98, 114, 164, 0.4); }
     .tag-fav { background: rgba(189, 147, 249, 0.2); color: var(--purple); border: 1px solid rgba(189, 147, 249, 0.4); }
     .tag-status-success { background: rgba(80, 250, 123, 0.2); color: var(--green); }
     .tag-status-notorrents { background: rgba(139, 233, 253, 0.2); color: var(--cyan); }
     .tag-status-running { background: rgba(241, 250, 140, 0.2); color: var(--yellow); }
     .tag-status-error { background: rgba(255, 85, 85, 0.2); color: var(--red); }
+
+    .badge-success { background: rgba(80, 250, 123, 0.2); color: var(--green); border: 1px solid rgba(80, 250, 123, 0.4); font-size: 0.72rem; font-weight: 700; padding: 0.2rem 0.5rem; border-radius: 4px; display: inline-block; }
+
+    .btn-grab {
+      background: linear-gradient(135deg, #50fa7b 0%, #3cdb64 100%);
+      color: #14151c;
+      font-weight: 700;
+      border: none;
+      padding: 0.3rem 0.65rem;
+      border-radius: 4px;
+      font-size: 0.75rem;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 0.35rem;
+      transition: all 0.15s ease;
+    }
+    .btn-grab:hover { filter: brightness(1.15); transform: translateY(-1px); }
+    .btn-grab:disabled { opacity: 0.6; cursor: not-allowed; transform: none; }
+
+    .settings-container {
+      flex: 1;
+      min-height: 0;
+      margin: 0.6rem 1.25rem 1rem;
+      background-color: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 8px;
+      overflow-y: auto;
+      padding: 1.25rem;
+      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.3);
+    }
+    .settings-section {
+      background: rgba(30, 31, 41, 0.6);
+      border: 1px solid var(--card-border);
+      border-radius: 8px;
+      padding: 1rem 1.2rem;
+      margin-bottom: 1.2rem;
+    }
+    .settings-section-title {
+      font-size: 0.95rem;
+      font-weight: 700;
+      color: var(--cyan);
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      border-bottom: 1px solid rgba(68, 71, 90, 0.4);
+      padding-bottom: 0.5rem;
+      margin-bottom: 0.85rem;
+    }
+    .settings-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap: 0.85rem;
+    }
+    .form-group {
+      display: flex;
+      flex-direction: column;
+      gap: 0.3rem;
+    }
+    .form-group label {
+      font-size: 0.75rem;
+      font-weight: 600;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+    .form-group input, .form-group select, .form-group textarea {
+      background: var(--bg);
+      border: 1px solid var(--card-border);
+      color: var(--text);
+      padding: 0.45rem 0.65rem;
+      border-radius: 6px;
+      font-family: inherit;
+      font-size: 0.8rem;
+      outline: none;
+      transition: border-color 0.15s;
+    }
+    .form-group input:focus, .form-group select:focus, .form-group textarea:focus {
+      border-color: var(--cyan);
+    }
+    .form-group small {
+      font-size: 0.68rem;
+      color: var(--muted);
+    }
+    .form-checkbox {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      cursor: pointer;
+      font-size: 0.8rem;
+      font-weight: 500;
+    }
+    .btn-save {
+      background: linear-gradient(135deg, #bd93f9 0%, #a470f5 100%);
+      color: #14151c;
+      font-weight: 700;
+      font-size: 0.85rem;
+      padding: 0.55rem 1.3rem;
+      border-radius: 6px;
+      border: none;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 0.5rem;
+      transition: all 0.15s;
+    }
+    .btn-save:hover { filter: brightness(1.15); transform: translateY(-1px); }
+    .btn-save:disabled { opacity: 0.6; cursor: not-allowed; }
 
     .btn-reset {
       background: rgba(255, 85, 85, 0.15);
@@ -911,9 +1223,16 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         <span>🏈</span> Grabbed Matches
         <span class="tab-counter" id="tab-count-torrents">0</span>
       </button>
+      <button class="tab-btn" data-tab="tab-browser">
+        <span>⚡</span> Active Week Matches
+        <span class="tab-counter" id="tab-count-browser">0</span>
+      </button>
       <button class="tab-btn" data-tab="tab-history">
         <span>📜</span> Run History
         <span class="tab-counter" id="tab-count-runs">0</span>
+      </button>
+      <button class="tab-btn" data-tab="tab-settings">
+        <span>⚙️</span> Settings
       </button>
     </div>
 
@@ -978,6 +1297,37 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       </div>
     </div>
 
+    <!-- TAB: Active Week Match Browser -->
+    <div class="tab-pane" id="tab-browser">
+      <div class="sub-bar">
+        <div class="search-box">
+          <input type="text" id="browser-search" placeholder="Search active week games...">
+        </div>
+        <div style="font-size: 0.78rem; color: var(--muted);" id="browser-summary">Loading active week games...</div>
+        <button class="btn-sm" id="btn-refresh-browser">🔄 Refresh from 720pier</button>
+      </div>
+
+      <div class="table-container">
+        <div class="table-scroll-container">
+          <table class="data-table" id="browser-table">
+            <thead>
+              <tr>
+                <th style="width: 50px;">#</th>
+                <th style="width: 90px;">Rating</th>
+                <th>Matchup / Release Title</th>
+                <th style="width: 120px; text-align: center;">Favorite</th>
+                <th style="width: 120px;">Topic Page</th>
+                <th style="width: 170px; text-align: center;">Action</th>
+              </tr>
+            </thead>
+            <tbody id="browser-tbody">
+              <tr><td colspan="6" style="text-align: center; color: var(--muted); padding: 2rem;">Loading games for active week...</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
     <!-- TAB 2: Run History -->
     <div class="tab-pane" id="tab-history">
       <div class="sub-bar">
@@ -1005,6 +1355,188 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             </tbody>
           </table>
         </div>
+      </div>
+    </div>
+
+    <!-- TAB: Settings Management -->
+    <div class="tab-pane" id="tab-settings">
+      <div class="sub-bar">
+        <div style="font-size: 0.8rem; font-weight: 600; color: var(--cyan);">Application Configuration (.env)</div>
+        <div style="font-size: 0.75rem; color: var(--muted);">Changes are saved to disk and hot-reloaded immediately</div>
+        <button class="btn-sm" id="btn-reload-settings">Reset Form</button>
+      </div>
+
+      <div class="settings-container">
+        <form id="settings-form" onsubmit="event.preventDefault(); saveSettings();">
+          <!-- Section 1 -->
+          <div class="settings-section">
+            <div class="settings-section-title"><span>🏈</span> Match &amp; Grabber Preferences</div>
+            <div class="settings-grid">
+              <div class="form-group">
+                <label>Favorite Teams (comma-separated)</label>
+                <input type="text" id="cfg-FAVORITE_TEAMS" placeholder="Kansas City Chiefs, KC, Chiefs">
+                <small>Matches involving these teams are always grabbed even if outside top rated matches</small>
+              </div>
+              <div class="form-group">
+                <label>Top Matches Limit</label>
+                <input type="number" id="cfg-TOP_MATCHES_LIMIT" min="1" max="10" placeholder="1">
+                <small>Number of highest-rated matches to grab per week (1 = top match only)</small>
+              </div>
+              <div class="form-group">
+                <label>Quality Preference</label>
+                <select id="cfg-QUALITY_PREFERENCE">
+                  <option value="">Any (first available)</option>
+                  <option value="1080p">1080p</option>
+                  <option value="720p">720p</option>
+                </select>
+                <small>Filter torrents by resolution when multiple releases exist</small>
+              </div>
+              <div class="form-group" style="justify-content: center;">
+                <label class="form-checkbox">
+                  <input type="checkbox" id="cfg-RENAME_TORRENT_FILES">
+                  <span>Standardize File Names (e.g. Week 08 - Team A at Team B)</span>
+                </label>
+                <label class="form-checkbox" style="margin-top: 0.5rem;">
+                  <input type="checkbox" id="cfg-QBIT_AUTO_START">
+                  <span>Auto-start downloads in qBittorrent</span>
+                </label>
+              </div>
+            </div>
+          </div>
+
+          <!-- Section 2 -->
+          <div class="settings-section">
+            <div class="settings-section-title"><span>⏰</span> Service Schedule &amp; Timing</div>
+            <div class="settings-grid">
+              <div class="form-group">
+                <label>Schedule Days</label>
+                <input type="text" id="cfg-SCHEDULE_DAYS" placeholder="Mon,Tue,Wed,Thu,Fri,Sat,Sun">
+                <small>Days of week the grabber runs (comma-separated)</small>
+              </div>
+              <div class="form-group">
+                <label>Schedule Times (HH:MM or 12h)</label>
+                <input type="text" id="cfg-SCHEDULE_TIMES" placeholder="09:00,15:00,21:00">
+                <small>Specific times of day to trigger grabber checks</small>
+              </div>
+              <div class="form-group">
+                <label>Top Matches Days</label>
+                <input type="text" id="cfg-TOP_MATCHES_DAYS" placeholder="Mon,Tue,Wed">
+                <small>Days to evaluate top rated games (other days grab favorite teams only)</small>
+              </div>
+              <div class="form-group">
+                <label>Interval Hours (Fallback)</label>
+                <input type="number" id="cfg-CHECK_INTERVAL_HOURS" step="0.5" min="0.5" placeholder="6">
+                <small>Used only if Schedule Times is empty</small>
+              </div>
+            </div>
+          </div>
+
+          <!-- Section 3 -->
+          <div class="settings-section">
+            <div class="settings-section-title"><span>🌐</span> 720pier Tracker Connection</div>
+            <div class="settings-grid">
+              <div class="form-group" style="grid-column: span 2;">
+                <label>Thread URL</label>
+                <input type="text" id="cfg-PIER_THREAD_URL" placeholder="https://720pier.ru/viewtopic.php?t=76272">
+              </div>
+              <div class="form-group">
+                <label>Username</label>
+                <input type="text" id="cfg-PIER_USERNAME" placeholder="720pier forum username">
+              </div>
+              <div class="form-group">
+                <label>Password</label>
+                <input type="password" id="cfg-PIER_PASSWORD" placeholder="Leave unchanged to keep existing">
+              </div>
+              <div class="form-group" style="grid-column: span 2;">
+                <label>Session Cookie (PIER_COOKIE)</label>
+                <textarea id="cfg-PIER_COOKIE" rows="2" placeholder="Leave unchanged to keep existing or paste updated browser cookie"></textarea>
+                <small>Used to authenticate if Cloudflare or CAPTCHA is present on 720pier</small>
+              </div>
+              <div class="form-group" style="grid-column: span 2;">
+                <label>Proxy URL (Optional)</label>
+                <input type="text" id="cfg-PROXY_URL" placeholder="socks5://127.0.0.1:1080 or http://proxy:8080">
+              </div>
+            </div>
+          </div>
+
+          <!-- Section 4 -->
+          <div class="settings-section">
+            <div class="settings-section-title"><span>⚡</span> qBittorrent Configuration</div>
+            <div class="settings-grid">
+              <div class="form-group">
+                <label>Host URL</label>
+                <input type="text" id="cfg-QBIT_HOST" placeholder="http://qbittorrent:8087">
+              </div>
+              <div class="form-group">
+                <label>API Key (qBittorrent v5.2+)</label>
+                <input type="password" id="cfg-QBIT_API_KEY" placeholder="Leave unchanged to keep existing">
+              </div>
+              <div class="form-group">
+                <label>Username (Fallback)</label>
+                <input type="text" id="cfg-QBIT_USERNAME" placeholder="admin">
+              </div>
+              <div class="form-group">
+                <label>Password (Fallback)</label>
+                <input type="password" id="cfg-QBIT_PASSWORD" placeholder="Leave unchanged to keep existing">
+              </div>
+              <div class="form-group">
+                <label>Save Path</label>
+                <input type="text" id="cfg-QBIT_SAVE_PATH" placeholder="/nfl">
+              </div>
+              <div class="form-group">
+                <label>Category</label>
+                <input type="text" id="cfg-QBIT_CATEGORY" placeholder="NFL">
+              </div>
+              <div class="form-group">
+                <label>Tags</label>
+                <input type="text" id="cfg-QBIT_TAGS" placeholder="720pier,thuuz">
+              </div>
+            </div>
+          </div>
+
+          <!-- Section 5 -->
+          <div class="settings-section">
+            <div class="settings-section-title"><span>🔔</span> Notifications (Discord &amp; Telegram)</div>
+            <div class="settings-grid">
+              <div class="form-group" style="grid-column: span 2;">
+                <label>Discord Webhook URL</label>
+                <input type="password" id="cfg-DISCORD_WEBHOOK_URL" placeholder="Leave unchanged to keep existing">
+              </div>
+              <div class="form-group">
+                <label>Telegram Bot Token</label>
+                <input type="password" id="cfg-TELEGRAM_BOT_TOKEN" placeholder="Leave unchanged to keep existing">
+              </div>
+              <div class="form-group">
+                <label>Telegram Chat ID</label>
+                <input type="text" id="cfg-TELEGRAM_CHAT_ID" placeholder="e.g. 123456789">
+              </div>
+            </div>
+          </div>
+
+          <!-- Section 6 -->
+          <div class="settings-section">
+            <div class="settings-section-title"><span>🔒</span> Dashboard Security (HTTP Basic Auth)</div>
+            <div class="settings-grid">
+              <div class="form-group">
+                <label>Web Dashboard Username</label>
+                <input type="text" id="cfg-WEB_USERNAME" placeholder="Leave blank to disable authentication">
+                <small>Requires browser login prompt when accessing dashboard</small>
+              </div>
+              <div class="form-group">
+                <label>Web Dashboard Password</label>
+                <input type="password" id="cfg-WEB_PASSWORD" placeholder="Leave unchanged to keep existing">
+              </div>
+            </div>
+          </div>
+
+          <!-- Save Button Bar -->
+          <div style="display: flex; align-items: center; justify-content: flex-end; gap: 1rem; padding: 0.5rem 0 1.5rem;">
+            <span id="settings-status" style="font-size: 0.8rem; color: var(--green);"></span>
+            <button type="submit" class="btn-save" id="btn-save-settings">
+              <span>💾</span> Save &amp; Apply Settings
+            </button>
+          </div>
+        </form>
       </div>
     </div>
 
@@ -1054,7 +1586,9 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         document.getElementById(targetId).classList.add('active');
 
         if (targetId === 'tab-matches') fetchMatches();
+        if (targetId === 'tab-browser') fetchBrowserMatches();
         if (targetId === 'tab-history') fetchHistory();
+        if (targetId === 'tab-settings') loadSettings();
       });
     });
 
@@ -1298,6 +1832,265 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
     document.getElementById('btn-refresh-history').addEventListener('click', fetchHistory);
 
+    // Active Week Match Browser Management
+    let browserData = [];
+
+    async function fetchBrowserMatches(forceRefresh = false) {
+      const tbody = document.getElementById('browser-tbody');
+      const summary = document.getElementById('browser-summary');
+      const refreshBtn = document.getElementById('btn-refresh-browser');
+      if (forceRefresh) {
+        refreshBtn.disabled = true;
+        refreshBtn.textContent = '🔄 Fetching...';
+      }
+      summary.textContent = forceRefresh ? 'Scraping 720pier for active week matches...' : 'Loading active week matches...';
+
+      try {
+        const url = forceRefresh ? '/api/matches/refresh' : '/api/matches';
+        const opts = forceRefresh ? { method: 'POST' } : { method: 'GET' };
+        const res = await fetch(url, opts);
+        const data = await res.json();
+        if (!data.ok) throw new Error(data.error || 'Failed to fetch matches');
+
+        browserData = data.matches || [];
+        document.getElementById('tab-count-browser').textContent = browserData.length;
+        renderBrowserMatches(data.week || 'Active Week');
+        if (forceRefresh) {
+          showToast(`Refreshed ${browserData.length} games for ${data.week || 'Active Week'}!`, 'success');
+        }
+      } catch (err) {
+        summary.textContent = 'Error fetching active week games.';
+        tbody.innerHTML = `<tr><td colspan="6" style="text-align: center; color: var(--red); padding: 2rem;">Error: ${escapeHtml(err.message)}</td></tr>`;
+        if (forceRefresh) showToast('Failed to refresh matches: ' + err.message, 'error');
+      } finally {
+        refreshBtn.disabled = false;
+        refreshBtn.innerHTML = '🔄 Refresh from 720pier';
+      }
+    }
+
+    function renderBrowserMatches(weekTitle = 'Active Week') {
+      const tbody = document.getElementById('browser-tbody');
+      const query = (document.getElementById('browser-search').value || '').toLowerCase().trim();
+      const filtered = browserData.filter(m => {
+        const text = `${m.title} ${m.rating || ''}`.toLowerCase();
+        return !query || text.includes(query);
+      });
+
+      document.getElementById('browser-summary').textContent = `${weekTitle} — Showing ${filtered.length} of ${browserData.length} match(es)`;
+
+      if (filtered.length === 0) {
+        tbody.innerHTML = `<tr><td colspan="6" style="text-align: center; color: var(--muted); padding: 2rem;">No games match your search criteria.</td></tr>`;
+        return;
+      }
+
+      tbody.innerHTML = filtered.map((m, idx) => {
+        const ratingVal = parseInt(m.rating, 10);
+        let tagClass = 'tag-high';
+        if (isNaN(ratingVal)) tagClass = 'tag-low';
+        else if (ratingVal < 70) tagClass = 'tag-low';
+        else if (ratingVal < 90) tagClass = 'tag-med';
+
+        const favBadge = m.is_favorite
+          ? '<span class="tag-badge tag-fav">KC Chiefs</span>'
+          : '<span style="color: var(--muted); font-size: 0.72rem;">--</span>';
+
+        const ratingBadge = m.rating && m.rating !== 'N/A'
+          ? `<span class="tag-badge ${tagClass}">${escapeHtml(m.rating)} pts</span>`
+          : '<span class="tag-badge tag-low">N/A</span>';
+
+        let actionCol = '';
+        if (m.is_grabbed) {
+          actionCol = '<span class="badge-success">✅ Grabbed</span>';
+        } else {
+          const safeUrl = encodeURIComponent(m.url);
+          const safeTitle = encodeURIComponent(m.title);
+          const safeRating = encodeURIComponent(m.rating || '');
+          const safeWeek = encodeURIComponent(weekTitle);
+          actionCol = `<button class="btn-grab" id="grab-btn-${idx}" onclick="manualDownloadMatch('${safeUrl}', '${safeTitle}', '${safeRating}', '${safeWeek}', 'grab-btn-${idx}')">📥 Download to qBit</button>`;
+        }
+
+        return `<tr>
+          <td style="color: var(--muted); font-family: 'Fira Code', monospace;">#${idx + 1}</td>
+          <td>${ratingBadge}</td>
+          <td><strong style="font-weight: 600; color: var(--text);">${escapeHtml(m.title)}</strong></td>
+          <td style="text-align: center;">${favBadge}</td>
+          <td><a href="${escapeHtml(m.url)}" target="_blank" style="color: var(--cyan); text-decoration: none; font-size: 0.75rem;">View Topic ↗</a></td>
+          <td style="text-align: center;">${actionCol}</td>
+        </tr>`;
+      }).join('');
+    }
+
+    async function manualDownloadMatch(encUrl, encTitle, encRating, encWeek, btnId) {
+      const url = decodeURIComponent(encUrl);
+      const title = decodeURIComponent(encTitle);
+      const rating = decodeURIComponent(encRating);
+      const week = decodeURIComponent(encWeek);
+      const btn = document.getElementById(btnId);
+
+      if (btn) {
+        btn.disabled = true;
+        btn.textContent = '⏳ Grabbing...';
+      }
+
+      try {
+        const res = await fetch('/api/matches/download', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ url, title, rating, week })
+        });
+        const data = await res.json();
+        if (data.ok) {
+          showToast(data.message || `Successfully sent "${title}" to qBittorrent!`, 'success', 5000);
+          if (btn) {
+            btn.outerHTML = '<span class="badge-success">✅ Grabbed</span>';
+          }
+          const item = browserData.find(x => x.url === url || x.title === title);
+          if (item) item.is_grabbed = true;
+          fetchMatches();
+          fetchStatus();
+        } else {
+          showToast(`Failed to grab match: ${data.error}`, 'error', 6000);
+          if (btn) {
+            btn.disabled = false;
+            btn.innerHTML = '📥 Download to qBit';
+          }
+        }
+      } catch (err) {
+        showToast('Network error downloading match: ' + err.message, 'error');
+        if (btn) {
+          btn.disabled = false;
+          btn.innerHTML = '📥 Download to qBit';
+        }
+      }
+    }
+
+    document.getElementById('btn-refresh-browser').addEventListener('click', () => fetchBrowserMatches(true));
+    document.getElementById('browser-search').addEventListener('input', () => renderBrowserMatches());
+
+    // Settings Management
+    async function loadSettings() {
+      const status = document.getElementById('settings-status');
+      status.textContent = 'Loading settings...';
+      status.style.color = 'var(--cyan)';
+      try {
+        const res = await fetch('/api/settings');
+        const data = await res.json();
+        if (!data.ok) throw new Error(data.error || 'Failed to load settings');
+        const s = data.settings || {};
+
+        document.getElementById('cfg-FAVORITE_TEAMS').value = s.favorite_teams || '';
+        document.getElementById('cfg-TOP_MATCHES_LIMIT').value = s.top_matches_limit || 1;
+        document.getElementById('cfg-QUALITY_PREFERENCE').value = s.quality_preference || '';
+        document.getElementById('cfg-RENAME_TORRENT_FILES').checked = Boolean(s.rename_torrent_files);
+        document.getElementById('cfg-QBIT_AUTO_START').checked = Boolean(s.qbit_auto_start);
+
+        document.getElementById('cfg-SCHEDULE_DAYS').value = s.schedule_days || '';
+        document.getElementById('cfg-SCHEDULE_TIMES').value = s.schedule_times || '';
+        document.getElementById('cfg-TOP_MATCHES_DAYS').value = s.top_matches_days || '';
+        document.getElementById('cfg-CHECK_INTERVAL_HOURS').value = s.check_interval_hours || 6;
+
+        document.getElementById('cfg-PIER_THREAD_URL').value = s.pier_thread_url || '';
+        document.getElementById('cfg-PIER_USERNAME').value = s.pier_username || '';
+        document.getElementById('cfg-PIER_PASSWORD').value = s.has_pier_password ? '********' : '';
+        document.getElementById('cfg-PIER_COOKIE').value = s.has_pier_cookie ? '********' : '';
+        document.getElementById('cfg-PROXY_URL').value = s.proxy_url || '';
+
+        document.getElementById('cfg-QBIT_HOST').value = s.qbit_host || '';
+        document.getElementById('cfg-QBIT_API_KEY').value = s.has_qbit_api_key ? '********' : '';
+        document.getElementById('cfg-QBIT_USERNAME').value = s.qbit_username || '';
+        document.getElementById('cfg-QBIT_PASSWORD').value = s.has_qbit_password ? '********' : '';
+        document.getElementById('cfg-QBIT_SAVE_PATH').value = s.qbit_save_path || '';
+        document.getElementById('cfg-QBIT_CATEGORY').value = s.qbit_category || '';
+        document.getElementById('cfg-QBIT_TAGS').value = s.qbit_tags || '';
+
+        document.getElementById('cfg-DISCORD_WEBHOOK_URL').value = s.has_discord_webhook ? '********' : '';
+        document.getElementById('cfg-TELEGRAM_BOT_TOKEN').value = s.has_telegram_bot ? '********' : '';
+        document.getElementById('cfg-TELEGRAM_CHAT_ID').value = s.telegram_chat_id || '';
+
+        document.getElementById('cfg-WEB_USERNAME').value = s.web_username || '';
+        document.getElementById('cfg-WEB_PASSWORD').value = s.has_web_auth ? '********' : '';
+
+        status.textContent = 'Configuration loaded.';
+        status.style.color = 'var(--green)';
+        setTimeout(() => { if (status.textContent === 'Configuration loaded.') status.textContent = ''; }, 3000);
+      } catch (err) {
+        status.textContent = 'Failed to load configuration: ' + err.message;
+        status.style.color = 'var(--red)';
+      }
+    }
+
+    async function saveSettings() {
+      const saveBtn = document.getElementById('btn-save-settings');
+      const status = document.getElementById('settings-status');
+      saveBtn.disabled = true;
+      saveBtn.innerHTML = '<span>⏳</span> Saving...';
+      status.style.color = 'var(--cyan)';
+      status.textContent = 'Writing settings to .env and reloading...';
+
+      const payload = {
+        FAVORITE_TEAMS: document.getElementById('cfg-FAVORITE_TEAMS').value,
+        TOP_MATCHES_LIMIT: document.getElementById('cfg-TOP_MATCHES_LIMIT').value,
+        QUALITY_PREFERENCE: document.getElementById('cfg-QUALITY_PREFERENCE').value,
+        RENAME_TORRENT_FILES: document.getElementById('cfg-RENAME_TORRENT_FILES').checked ? 'true' : 'false',
+        QBIT_AUTO_START: document.getElementById('cfg-QBIT_AUTO_START').checked ? 'true' : 'false',
+
+        SCHEDULE_DAYS: document.getElementById('cfg-SCHEDULE_DAYS').value,
+        SCHEDULE_TIMES: document.getElementById('cfg-SCHEDULE_TIMES').value,
+        TOP_MATCHES_DAYS: document.getElementById('cfg-TOP_MATCHES_DAYS').value,
+        CHECK_INTERVAL_HOURS: document.getElementById('cfg-CHECK_INTERVAL_HOURS').value,
+
+        PIER_THREAD_URL: document.getElementById('cfg-PIER_THREAD_URL').value,
+        PIER_USERNAME: document.getElementById('cfg-PIER_USERNAME').value,
+        PIER_PASSWORD: document.getElementById('cfg-PIER_PASSWORD').value,
+        PIER_COOKIE: document.getElementById('cfg-PIER_COOKIE').value,
+        PROXY_URL: document.getElementById('cfg-PROXY_URL').value,
+
+        QBIT_HOST: document.getElementById('cfg-QBIT_HOST').value,
+        QBIT_API_KEY: document.getElementById('cfg-QBIT_API_KEY').value,
+        QBIT_USERNAME: document.getElementById('cfg-QBIT_USERNAME').value,
+        QBIT_PASSWORD: document.getElementById('cfg-QBIT_PASSWORD').value,
+        QBIT_SAVE_PATH: document.getElementById('cfg-QBIT_SAVE_PATH').value,
+        QBIT_CATEGORY: document.getElementById('cfg-QBIT_CATEGORY').value,
+        QBIT_TAGS: document.getElementById('cfg-QBIT_TAGS').value,
+
+        DISCORD_WEBHOOK_URL: document.getElementById('cfg-DISCORD_WEBHOOK_URL').value,
+        TELEGRAM_BOT_TOKEN: document.getElementById('cfg-TELEGRAM_BOT_TOKEN').value,
+        TELEGRAM_CHAT_ID: document.getElementById('cfg-TELEGRAM_CHAT_ID').value,
+
+        WEB_USERNAME: document.getElementById('cfg-WEB_USERNAME').value,
+        WEB_PASSWORD: document.getElementById('cfg-WEB_PASSWORD').value,
+      };
+
+      try {
+        const res = await fetch('/api/settings', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+        const data = await res.json();
+        if (data.ok) {
+          showToast(data.message || 'Settings saved and applied successfully!', 'success', 5000);
+          status.style.color = 'var(--green)';
+          status.textContent = 'Settings saved and applied successfully!';
+          loadSettings();
+          fetchStatus();
+        } else {
+          showToast('Error saving settings: ' + (data.error || 'Unknown error'), 'error', 6000);
+          status.style.color = 'var(--red)';
+          status.textContent = 'Error: ' + data.error;
+        }
+      } catch (err) {
+        showToast('Network error saving settings: ' + err.message, 'error');
+        status.style.color = 'var(--red)';
+        status.textContent = 'Network error: ' + err.message;
+      } finally {
+        saveBtn.disabled = false;
+        saveBtn.innerHTML = '<span>💾</span> Save &amp; Apply Settings';
+      }
+    }
+
+    document.getElementById('btn-reload-settings').addEventListener('click', loadSettings);
+
     // Status Polling
     async function fetchStatus() {
       try {
@@ -1342,6 +2135,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     // Initial load and periodic status polling (every 3s)
     fetchStatus();
     fetchMatches();
+    fetchBrowserMatches();
     fetchHistory();
     setInterval(fetchStatus, 3000);
   </script>
@@ -1357,9 +2151,45 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 class LogRequestHandler(http.server.BaseHTTPRequestHandler):
     """Handles HTTP requests for Dashboard UI, REST endpoints, and log exports."""
 
+    def log_request(self, code="-", size="-"):
+        pass
+
     def log_message(self, format, *args):
         # Silence default standard server request logging to avoid recursive log growth
         pass
+
+    def check_auth(self) -> bool:
+        """Verifies HTTP Basic Auth if web credentials are configured."""
+        cfg = _service_context.get("config")
+        if not cfg or not getattr(cfg, "web_username", None) or not getattr(cfg, "web_password", None):
+            return True
+
+        auth_header = self.headers.get("Authorization")
+        if not auth_header or not auth_header.startswith("Basic "):
+            self.send_auth_challenge()
+            return False
+
+        try:
+            import base64
+            encoded = auth_header.split(" ", 1)[1].strip()
+            decoded = base64.b64decode(encoded).decode("utf-8")
+            if ":" in decoded:
+                user, pwd = decoded.split(":", 1)
+                if user == cfg.web_username and pwd == cfg.web_password:
+                    return True
+        except Exception:
+            pass
+
+        self.send_auth_challenge()
+        return False
+
+    def send_auth_challenge(self):
+        """Sends HTTP 401 challenge requesting Basic authentication."""
+        self.send_response(401)
+        self.send_header("WWW-Authenticate", 'Basic realm="NFL Grabber Dashboard"')
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(json.dumps({"ok": False, "error": "Unauthorized"}).encode("utf-8"))
 
     def _send_json(self, status_code: int, data: Dict[str, Any]):
         body = json.dumps(data).encode("utf-8")
@@ -1371,6 +2201,9 @@ class LogRequestHandler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
+        if not self.check_auth():
+            return
+
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
         params = urllib.parse.parse_qs(parsed.query)
@@ -1400,6 +2233,19 @@ class LogRequestHandler(http.server.BaseHTTPRequestHandler):
                 "total_torrents": total_torrents,
             }
             self._send_json(200, payload)
+
+        elif path == "/api/matches":
+            force_refresh = "refresh" in params and params["refresh"][0].lower() in ("1", "true", "yes")
+            res = fetch_active_week_matches(force_refresh=force_refresh)
+            self._send_json(200 if res.get("ok", True) else 500, res)
+
+        elif path == "/api/settings":
+            cfg = _service_context.get("config")
+            if cfg:
+                from src.config import get_masked_settings
+                self._send_json(200, {"ok": True, "settings": get_masked_settings(cfg)})
+            else:
+                self._send_json(500, {"ok": False, "error": "Configuration not loaded"})
 
         elif path == "/api/logs":
             with _log_lock:
@@ -1457,6 +2303,9 @@ class LogRequestHandler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(b"404 Not Found")
 
     def do_POST(self):
+        if not self.check_auth():
+            return
+
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
         params = urllib.parse.parse_qs(parsed.query)
@@ -1483,6 +2332,48 @@ class LogRequestHandler(http.server.BaseHTTPRequestHandler):
                 self._send_json(409, {"ok": False, "error": msg})
             else:
                 self._send_json(202, {"ok": True, "message": msg, "dry_run": dry_run})
+
+        elif path == "/api/matches/refresh":
+            res = fetch_active_week_matches(force_refresh=True)
+            self._send_json(200 if res.get("ok", True) else 500, res)
+
+        elif path == "/api/matches/download":
+            url = body_data.get("url") or params.get("url", [""])[0]
+            title = body_data.get("title") or params.get("title", [""])[0]
+            rating = body_data.get("rating") or params.get("rating", [""])[0]
+            week = body_data.get("week") or params.get("week", [""])[0]
+
+            if not url or not title:
+                self._send_json(400, {"ok": False, "error": "Missing required 'url' or 'title' parameter."})
+                return
+
+            success, msg = download_single_match(url, title, rating=rating, week=week)
+            self._send_json(200 if success else 500, {"ok": success, "message": msg, "error": msg if not success else None})
+
+        elif path == "/api/settings":
+            from src.config import Config, update_env_file, get_masked_settings
+            if not body_data:
+                self._send_json(400, {"ok": False, "error": "No settings provided in request body."})
+                return
+
+            success = update_env_file(body_data)
+            if success:
+                new_cfg = Config.load()
+                _service_context["config"] = new_cfg
+                reloader = _service_context.get("schedule_reloader")
+                if reloader:
+                    try:
+                        reloader()
+                    except Exception as r_err:
+                        logger.warning("Notice updating scheduler: %s", r_err)
+
+                self._send_json(200, {
+                    "ok": True,
+                    "message": "Settings saved to .env and applied in-memory!",
+                    "settings": get_masked_settings(new_cfg),
+                })
+            else:
+                self._send_json(500, {"ok": False, "error": "Failed to update .env configuration file."})
 
         elif path == "/api/test/qbit":
             res = run_qbit_diagnostic()
@@ -1524,6 +2415,7 @@ def start_web_server(
     notifier: Any = None,
     cycle_runner: Optional[Callable[..., Any]] = None,
     schedule_logger: Optional[Callable[[], Any]] = None,
+    schedule_reloader: Optional[Callable[[], Any]] = None,
 ):
     """
     Spins up the lightweight Web UI server in a daemon thread.
@@ -1535,6 +2427,7 @@ def start_web_server(
     _service_context["notifier"] = notifier
     _service_context["cycle_runner"] = cycle_runner
     _service_context["schedule_logger"] = schedule_logger
+    _service_context["schedule_reloader"] = schedule_reloader
 
     class ReusableThreadingServer(http.server.ThreadingHTTPServer):
         allow_reuse_address = True

@@ -1,7 +1,7 @@
 import os
 import re
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Optional
 from dotenv import load_dotenv
 
 # Load .env file from current directory or parent directories
@@ -63,6 +63,7 @@ class Config:
     check_interval_hours: float
     schedule_days: list[str]
     top_matches_days: list[str]
+    top_matches_limit: int
     schedule_times: list[str]
     run_on_startup: bool
     state_file_path: str
@@ -79,9 +80,16 @@ class Config:
     # Web Server & Log Viewer
     web_port: int
     web_enabled: bool
+    web_username: Optional[str] = None
+    web_password: Optional[str] = None
 
     @classmethod
-    def load(cls) -> "Config":
+    def load(cls, env_path: Optional[str] = None) -> "Config":
+        if env_path and os.path.isfile(env_path):
+            load_dotenv(env_path, override=True)
+        else:
+            load_dotenv(override=True)
+
         raw_times = os.getenv("SCHEDULE_TIMES", "09:00,15:00,21:00").split(",")
         parsed_times = []
         for item in raw_times:
@@ -124,6 +132,7 @@ class Config:
                 for d in os.getenv("TOP_MATCHES_DAYS", "Mon,Tue,Wed").split(",")
                 if d.strip()
             ],
+            top_matches_limit=max(1, int(os.getenv("TOP_MATCHES_LIMIT", "1").strip() or 1)) if os.getenv("TOP_MATCHES_LIMIT", "1").strip().isdigit() else 1,
             schedule_times=parsed_times,
             run_on_startup=os.getenv("RUN_ON_STARTUP", "false").lower() in ("true", "1", "yes"),
             state_file_path=os.getenv("STATE_FILE_PATH", "data/state.json").strip(),
@@ -133,4 +142,109 @@ class Config:
             telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID", "").strip() or None,
             web_port=int(os.getenv("WEB_PORT", "5020")),
             web_enabled=os.getenv("WEB_ENABLED", "true").lower() in ("true", "1", "yes"),
+            web_username=os.getenv("WEB_USERNAME", "").strip() or None,
+            web_password=os.getenv("WEB_PASSWORD", "").strip() or None,
         )
+
+
+def update_env_file(updates: dict[str, Any], env_path: str = ".env") -> bool:
+    """
+    Safely updates key-value pairs in the .env file while preserving comments and structure.
+    Ignores masked secrets (e.g. '********' or starting with '***').
+    Also updates os.environ immediately.
+    """
+    try:
+        clean_updates: dict[str, str] = {}
+        for k, v in updates.items():
+            k_upper = k.strip().upper()
+            if not k_upper:
+                continue
+            v_str = str(v).strip() if v is not None else ""
+            # Preserve existing secret if masked value was submitted
+            if v_str == "********" or v_str.startswith("****"):
+                continue
+            clean_updates[k_upper] = v_str
+
+        existing_lines = []
+        if os.path.exists(env_path):
+            with open(env_path, "r", encoding="utf-8") as f:
+                existing_lines = f.readlines()
+
+        new_lines = []
+        handled_keys = set()
+
+        for line in existing_lines:
+            stripped = line.strip()
+            if stripped.startswith("#") or not stripped or "=" not in stripped:
+                new_lines.append(line)
+                continue
+
+            k, _ = stripped.split("=", 1)
+            k = k.strip()
+            if k in clean_updates:
+                new_lines.append(f"{k}={clean_updates[k]}\n")
+                handled_keys.add(k)
+                os.environ[k] = clean_updates[k]
+            else:
+                new_lines.append(line)
+
+        # Append any new keys that were not present in the original .env
+        unhandled = [k for k in clean_updates if k not in handled_keys]
+        if unhandled:
+            if new_lines and not new_lines[-1].endswith("\n"):
+                new_lines[-1] += "\n"
+            new_lines.append("\n# Added via Web UI\n")
+            for k in unhandled:
+                new_lines.append(f"{k}={clean_updates[k]}\n")
+                os.environ[k] = clean_updates[k]
+
+        with open(env_path, "w", encoding="utf-8") as f:
+            f.writelines(new_lines)
+
+        return True
+    except Exception as e:
+        import logging
+        logging.getLogger("NFLGrabber.Config").error("Failed to update .env file: %s", e)
+        return False
+
+
+def get_masked_settings(config: Config) -> dict[str, Any]:
+    """Returns a serialized dict of current settings with sensitive credentials masked."""
+    return {
+        "pier_thread_url": config.pier_thread_url,
+        "pier_username": config.pier_username or "",
+        "pier_password": "********" if config.pier_password else "",
+        "has_pier_password": bool(config.pier_password),
+        "pier_cookie": "********" if config.pier_cookie else "",
+        "has_pier_cookie": bool(config.pier_cookie),
+        "quality_preference": config.quality_preference or "",
+        "favorite_teams": ", ".join(config.favorite_teams),
+        "proxy_url": config.proxy_url or "",
+        "qbit_host": config.qbit_host,
+        "qbit_api_key": "********" if config.qbit_api_key else "",
+        "has_qbit_api_key": bool(config.qbit_api_key),
+        "qbit_username": config.qbit_username or "",
+        "qbit_password": "********" if config.qbit_password else "",
+        "has_qbit_password": bool(config.qbit_password),
+        "qbit_category": config.qbit_category,
+        "qbit_tags": config.qbit_tags,
+        "qbit_save_path": config.qbit_save_path or "",
+        "qbit_auto_start": config.qbit_auto_start,
+        "rename_torrent_files": config.rename_torrent_files,
+        "check_interval_hours": config.check_interval_hours,
+        "schedule_days": ", ".join(config.schedule_days),
+        "top_matches_days": ", ".join(config.top_matches_days),
+        "top_matches_limit": config.top_matches_limit,
+        "schedule_times": ", ".join(config.schedule_times),
+        "run_on_startup": config.run_on_startup,
+        "discord_webhook_url": "********" if config.discord_webhook_url else "",
+        "has_discord_webhook": bool(config.discord_webhook_url),
+        "telegram_bot_token": "********" if config.telegram_bot_token else "",
+        "has_telegram_bot": bool(config.telegram_bot_token),
+        "telegram_chat_id": config.telegram_chat_id or "",
+        "web_port": config.web_port,
+        "web_enabled": config.web_enabled,
+        "web_username": config.web_username or "",
+        "web_password": "********" if config.web_password else "",
+        "has_web_auth": bool(config.web_username and config.web_password),
+    }

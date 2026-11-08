@@ -181,13 +181,20 @@ def execute_grabber_cycle(
         is_top_day = is_scheduled_day(getattr(config, "top_matches_days", ["Mon", "Tue", "Wed"]))
         favorite_only = not is_top_day
 
+    top_limit_raw = getattr(config, "top_matches_limit", 1)
+    try:
+        effective_top_limit = max(1, int(top_limit_raw))
+    except (ValueError, TypeError):
+        effective_top_limit = 1
+
     mode_tags = []
     if dry_run:
         mode_tags.append("DRY RUN")
     if favorite_only:
         mode_tags.append("FAVORITE TEAMS ONLY")
     else:
-        mode_tags.append("TOP 2 MATCHES + FAVORITE TEAMS")
+        limit_label = f"TOP {effective_top_limit} MATCH{'ES' if effective_top_limit != 1 else ''}"
+        mode_tags.append(f"{limit_label} + FAVORITE TEAMS")
     mode_str = f" ({', '.join(mode_tags)})" if mode_tags else ""
 
     run_id = None
@@ -298,9 +305,27 @@ def execute_grabber_cycle(
         logger.info("Active Week: %s", week_title)
         update_service_status(active_week=week_title)
 
+        try:
+            from src.web import update_cached_matches
+            all_matches = scraper.get_all_matches_in_week(week_elem)
+            processed_matches = []
+            for m in all_matches:
+                is_g = state.is_match_or_url_processed(m.get("url", ""), m.get("title", ""), week=week_title) if hasattr(state, "is_match_or_url_processed") else state.is_torrent_processed(m.get("url", ""))
+                is_fav = scraper.matches_favorite_team(m.get("title", ""), config.favorite_teams)
+                processed_matches.append({
+                    "title": m.get("title", ""),
+                    "rating": m.get("rating", "N/A"),
+                    "url": m.get("url", ""),
+                    "is_grabbed": is_g,
+                    "is_favorite": is_fav,
+                })
+            update_cached_matches(week_title, processed_matches)
+        except Exception as cache_err:
+            logger.debug("Notice updating match cache: %s", cache_err)
+
         top_torrents = scraper.extract_top_torrent_links(
             week_elem,
-            limit=2,
+            limit=effective_top_limit,
             favorite_teams=config.favorite_teams,
             favorite_only=favorite_only,
         )
@@ -466,7 +491,13 @@ def main():
             current_dt=base_dt,
         )
         is_next_top = is_scheduled_day(config.top_matches_days, next_dt)
-        next_scope = "Top 2 + Favorite" if is_next_top else "Favorite Only"
+        top_limit_raw = getattr(config, "top_matches_limit", 1)
+        try:
+            top_limit_val = max(1, int(top_limit_raw))
+        except (ValueError, TypeError):
+            top_limit_val = 1
+        top_scope_label = f"Top {top_limit_val}" if top_limit_val != 1 else "Top 1"
+        next_scope = f"{top_scope_label} + Favorite" if is_next_top else "Favorite Only"
         rel_str = format_relative_time(next_dt, base_dt=base_dt)
         formatted_next = f"{next_dt.strftime('%A, %Y-%m-%d %H:%M:%S')} ({rel_str})"
         update_service_status(next_run=formatted_next, status="Running")
@@ -477,20 +508,6 @@ def main():
             next_scope,
         )
         return next_dt
-
-    # Start embedded lightweight web log viewer & control server
-    if getattr(config, "web_enabled", True):
-        start_web_server(
-            port=config.web_port,
-            db_path=config.db_path,
-            config=config,
-            state=state,
-            notifier=notifier,
-            cycle_runner=lambda dry_run=False, favorite_only=None: execute_grabber_cycle(
-                config, state, notifier, dry_run=dry_run, favorite_only=favorite_only
-            ),
-            schedule_logger=log_next_run,
-        )
 
     signal.signal(signal.SIGINT, handle_shutdown)
     signal.signal(signal.SIGTERM, handle_shutdown)
@@ -513,11 +530,43 @@ def main():
         from src.web import run_cycle_synchronized
         is_top_day = is_scheduled_day(config.top_matches_days)
         fav_only = not is_top_day
-        cycle_type_desc = "Top 2 matches + favorite team" if is_top_day else "Favorite team only"
+        top_limit_raw = getattr(config, "top_matches_limit", 1)
+        try:
+            top_limit_val = max(1, int(top_limit_raw))
+        except (ValueError, TypeError):
+            top_limit_val = 1
+        top_desc = f"Top {top_limit_val} match{'es' if top_limit_val != 1 else ''}"
+        cycle_type_desc = f"{top_desc} + favorite team" if is_top_day else "Favorite team only"
         logger.info("Triggering scheduled cycle for %s (%s)...", current_day_name, cycle_type_desc)
         success, _ = run_cycle_synchronized(dry_run=False, caller="scheduler", favorite_only=fav_only)
         log_next_run()
         return 1 if success else 0
+
+    def reconfigure_schedules():
+        schedule.clear()
+        sched_times = getattr(config, "schedule_times", None)
+        int_hours = max(0.1, config.check_interval_hours)
+        if sched_times:
+            for t_str in sched_times:
+                schedule.every().day.at(t_str).do(run_scheduled_cycle)
+        else:
+            schedule.every(int_hours).hours.do(run_scheduled_cycle)
+        log_next_run()
+
+    # Start embedded lightweight web log viewer & control server
+    if getattr(config, "web_enabled", True):
+        start_web_server(
+            port=config.web_port,
+            db_path=config.db_path,
+            config=config,
+            state=state,
+            notifier=notifier,
+            cycle_runner=lambda dry_run=False, favorite_only=None: execute_grabber_cycle(
+                config, state, notifier, dry_run=dry_run, favorite_only=favorite_only
+            ),
+            schedule_logger=log_next_run,
+            schedule_reloader=reconfigure_schedules,
+        )
 
     # Scheduled mode
     if schedule_times:
@@ -543,10 +592,16 @@ def main():
     if getattr(config, "run_on_startup", False):
         if is_scheduled_day(config.schedule_days):
             is_top_day = is_scheduled_day(config.top_matches_days)
+            top_limit_raw = getattr(config, "top_matches_limit", 1)
+            try:
+                top_limit_val = max(1, int(top_limit_raw))
+            except (ValueError, TypeError):
+                top_limit_val = 1
+            top_desc = f"Top {top_limit_val} match{'es' if top_limit_val != 1 else ''}"
             logger.info(
                 "Today (%s) is an active scheduled run day. Running initial grabber cycle (%s)...",
                 today_name,
-                "Top 2 matches + favorite team" if is_top_day else "Favorite team only",
+                f"{top_desc} + favorite team" if is_top_day else "Favorite team only",
             )
             from src.web import run_cycle_synchronized
             run_cycle_synchronized(dry_run=False, caller="startup", favorite_only=not is_top_day)
