@@ -1,5 +1,6 @@
 services:
   nfl-grabber:
+    image: ghcr.io/hazemsamak/nfl-720pier-scrapper:latest
     build:
       context: .
       dockerfile: Dockerfile

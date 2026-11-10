@@ -2,6 +2,7 @@
 
 [![Python 3.11+](https://img.shields.io/badge/Python-3.11+-3776AB.svg?logo=python&logoColor=white)](https://www.python.org/)
 [![Docker Ready](https://img.shields.io/badge/Docker-Ready-2496ED.svg?logo=docker&logoColor=white)](https://www.docker.com/)
+[![GHCR](https://img.shields.io/badge/GHCR-Docker%20Package-blue?logo=github&logoColor=white)](https://github.com/hazemsamak/nfl-720pier-scrapper/pkgs/container/nfl-720pier-scrapper)
 [![qBittorrent v4 & v5](https://img.shields.io/badge/qBittorrent-v4.x%20%7C%20v5.x-2F6792.svg?logo=bittorrent&logoColor=white)](https://www.qbittorrent.org/)
 [![Tests](https://img.shields.io/badge/Tests-40%20Passed-brightgreen.svg)](#local-development--testing)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
